@@ -1,0 +1,1831 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>업무 스케줄러 (주말/공휴일 제외 + 달력/월별/보류) — GAS 저장</title>
+<script>
+/* ========= TEST 모드 스위치 (기본: 꺼짐) ========= */
+window.__TEST_MODE__ = false;    // 테스트 패널에서만 true로 바꿈
+// window.__FORCE_TODAY__ = 'YYYY-MM-DD' // 테스트 패널이 설정/해제
+
+/* ========= 공용 선택자 ========= */
+const $ = (sel)=>document.querySelector(sel);
+
+/* ========= 상태 표시 ========= */
+function setStatus(txt){ const el = $('#statusLine'); if(el) el.textContent = txt; }
+
+/* =========================
+ * 저장/불러오기(GAS 또는 로컬)
+ * ========================= */
+const __read_ONLY__ = false;
+const CAN_EDIT = true;
+
+function hasGAS(){ return !!(window.google && google.script && google.script.run); }
+
+function saveData(data){
+  if(hasGAS()){
+    google.script.run.withSuccessHandler(function(){ setStatus("저장 성공 (서버)"); }).saveData(data);
+  } else {
+    console.log("로컬 실행:", data);
+    setStatus("저장은 로컬에서만 테스트됨 (서버 아님)");
+  }
+}
+
+function jsonbinGet(){
+  return new Promise((resolve)=>{
+    if (hasGAS()){
+      google.script.run.withSuccessHandler((data)=> resolve(data || {}))
+                       .withFailureHandler(()=> resolve({})).getData();
+    } else {
+      try{
+        const raw = localStorage.getItem("sched:server-dump");
+        resolve(raw ? JSON.parse(raw) : {});
+      }catch{ resolve({}); }
+    }
+  });
+}
+
+function jsonbinPut(payload){
+  return new Promise((resolve, reject)=>{
+    if (hasGAS()){
+      google.script.run.withSuccessHandler((res)=> resolve(res || {ok:true}))
+                       .withFailureHandler((err)=> reject(err)).putData(payload);
+    } else {
+      try{
+        localStorage.setItem("sched:server-dump", JSON.stringify(payload));
+        resolve({ok:true, local:true});
+      }catch(e){ reject(e); }
+    }
+  });
+}
+
+/* =========================
+ * 뷰포트 체크
+ * ========================= */
+const MOBILE_BREAKPOINT = 1100;
+function isMobileView() {
+  const w = Math.min(window.innerWidth || 9999, document.documentElement.clientWidth || 9999);
+  const ua = navigator.userAgent || "";
+  const isUAmm = /Android|iPhone|iPad|iPod|Mobile/i.test(ua);
+  return (w <= MOBILE_BREAKPOINT) || isUAmm;
+}
+
+/* =========================
+ * 비밀번호(편집 잠금)
+ * ========================= */
+const PASS_VALUE = '1234';
+let PASS_OK = false;
+const canEdit = () => CAN_EDIT && PASS_OK;
+
+/* =========================
+ * 유틸/영업일 계산
+ * ========================= */
+const uid = ()=> 'id-'+Math.random().toString(36).slice(2,9);
+
+// 날짜 포맷
+function toISO(d){
+  let x;
+  if (d instanceof Date){
+    x = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  } else if (typeof d === 'string'){
+    const [y,m,dd] = d.split('-').map(Number);
+    x = new Date(y, (m||1)-1, dd||1);
+  } else {
+    x = new Date(d);
+    x = new Date(x.getFullYear(), x.getMonth(), x.getDate());
+  }
+  const y = x.getFullYear();
+  const m = String(x.getMonth()+1).padStart(2,'0');
+  const dd = String(x.getDate()).padStart(2,'0');
+  return `${y}-${m}-${dd}`;
+}
+function parseISO(s){ const [y,m,d]=s.split('-').map(Number); const dt = new Date(y, m-1, d); dt.setHours(0,0,0,0); return dt; }
+function esc(s){
+  return (s==null ? '' : String(s)).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+}
+
+// ✅ 실제 오늘(항상 시스템 시간)
+function getRealTodayDate(){ const d=new Date(); d.setHours(0,0,0,0); return d; }
+function getRealTodayISO(){ return toISO(getRealTodayDate()); }
+
+// ✅ 화면·엔진에서 쓰는 "오늘" (TEST 모드일 때만 강제값 사용)
+function getTodayDate(){
+  if (window.__TEST_MODE__ &&
+      typeof window.__FORCE_TODAY__ === 'string' &&
+      /^\d{4}-\d{2}-\d{2}$/.test(window.__FORCE_TODAY__)){
+    return parseISO(window.__FORCE_TODAY__);
+  }
+  return getRealTodayDate();
+}
+function getTodayISO(){ return toISO(getTodayDate()); }
+
+function viewTodayISO(){
+  const t = window.__TEST_TODAY__;
+  return (typeof t === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(t)) ? t : getTodayISO();
+}
+
+
+// 기준일을 "실제 오늘"로 보정 (테스트 모드 영향 ❌)
+function ensureBaselineToday(owner){
+  if(!owner) return;
+  const today = getRealTodayISO();
+  if (!state.startByOwner) state.startByOwner = {};
+  if (state.startByOwner[owner] !== today){
+    state.startByOwner[owner] = today;
+    localStorage.setItem('sched:startByOwner', JSON.stringify(state.startByOwner));
+  }
+}
+
+const KR_2025 = new Set(['2025-01-01','2025-02-10','2025-02-11','2025-03-01','2025-05-05','2025-06-06','2025-08-15','2025-09-17','2025-09-18','2025-10-03','2025-10-09','2025-12-25']);
+const isWeekend = (d)=>{ const day = d.getDay(); return day===0 || day===6; };
+const isHoliday = (d)=> KR_2025.has(toISO(d));
+const isBiz = (d)=> !isWeekend(d) && !isHoliday(d);
+const bumpToBiz = (day)=>{ while(!isBiz(day)) day.setDate(day.getDate()+1); };
+function addBizDays(date, days){
+  const d = (date instanceof Date) ? new Date(date) : parseISO(String(date));
+  let left = Math.max(0, Math.floor(days));
+  while(left>0){ d.setDate(d.getDate()+1); if(isBiz(d)) left--; }
+  d.setHours(0,0,0,0);
+  return d;
+}
+function bizDaysBetween(startDate, endDate){
+  if(!startDate || !endDate) return 0;
+  const s = (startDate instanceof Date) ? new Date(startDate) : parseISO(String(startDate));
+  const e = (endDate   instanceof Date) ? new Date(endDate)   : parseISO(String(endDate));
+  s.setHours(0,0,0,0); e.setHours(0,0,0,0);
+  if(e < s) return 0;
+  let cnt = 0; const cur = new Date(s);
+  while(cur <= e){ if(isBiz(cur)) cnt++; cur.setDate(cur.getDate()+1); }
+  return cnt;
+}
+function debounce(fn, wait=200){ let t=null; return (...a)=>{ if(t)clearTimeout(t); t=setTimeout(()=>fn(...a),wait); }; }
+const isSimple = (t)=> (t.workType||'NEW') === '간단수정';
+
+/* 프로젝트 색상 */
+const PROJECT_COLORS = ["#fca5a5","#fdba74","#fcd34d","#bef264","#86efac","#93c5fd","#a5b4fc","#c4b5fd","#f9a8d4","#fda4af","#67e8f9","#5eead4"];
+function getProjectColor(id){ if(!id) return "#9ca3af"; let h=0; for(let i=0;i<id.length;i++) h=(h*31+id.charCodeAt(i))>>>0; return PROJECT_COLORS[h%PROJECT_COLORS.length]; }
+function getContrastText(hex){
+  const c=hex.replace('#','');
+  const r=parseInt(c.length===3?c[0]+c[0]:c.slice(0,2),16);
+  const g=parseInt(c.length===3?c[1]+c[1]:c.slice(2,4),16);
+  const b=parseInt(c.length===3?c[2]+c[2]:c.slice(4,6),16);
+  const yiq=(r*299+g*587+b*114)/1000;
+  return yiq>=150?"#111827":"#ffffff";
+}
+
+/* 하위 id 수집 */
+function collectDescendantIds(tasks, rootId){
+  const ids = new Set([rootId]); let changed = true;
+  while (changed){
+    changed = false;
+    for (const t of tasks){
+      if (t.group && ids.has(t.group) && !ids.has(t.id)){ ids.add(t.id); changed = true; }
+    }
+  }
+  return ids;
+}
+
+/* 작업 시작 모달 */
+function openScheduleDialog(defaults){
+  return new Promise((resolve, reject)=>{
+    const startISO = defaults?.startISO || getTodayISO();
+    const duration = Number.isFinite(defaults?.duration) ? defaults.duration : 1;
+    const host = $('#modalHost');
+    host.innerHTML = `
+      <div class="modal-overlay" role="dialog" aria-modal="true">
+        <div class="modal">
+          <h3>작업 시작 일정</h3>
+          <div class="modal-body">
+            <label>시작일 <input type="date" id="mdStart" value="${startISO}"></label>
+            <label>기간(영업일) <input type="number" id="mdDur" min="1" value="${duration}"></label>
+          </div>
+          <div class="modal-actions">
+            <button class="btn" id="mdCancel">취소</button>
+            <button class="btn primary" id="mdOk">확인</button>
+          </div>
+        </div>
+      </div>`;
+    const onClose = ()=>{ host.innerHTML = ''; };
+    host.querySelector('#mdCancel').addEventListener('click', ()=>{ onClose(); reject(new Error('cancel')); }, {passive:true});
+    host.querySelector('#mdOk').addEventListener('click', ()=>{ 
+      const s = host.querySelector('#mdStart').value || getTodayISO();
+      let d = parseInt(host.querySelector('#mdDur').value,10);
+      if(!(d>0)) d = 1;
+      onClose(); resolve({ startISO: s, duration: d });
+    }, {passive:true});
+    host.querySelector('.modal-overlay').addEventListener('click', (e)=>{ if(e.target.classList.contains('modal-overlay')){ onClose(); reject(new Error('cancel')); }});
+    document.addEventListener('keydown', function onEsc(ev){ if(ev.key==='Escape'){ document.removeEventListener('keydown', onEsc); onClose(); reject(new Error('cancel')); } }, { once:true });
+  });
+}
+
+/* =========================
+ * 전역 상태
+ * ========================= */
+let lastSavedJSON = '';
+let __todayCache = getTodayISO();
+setInterval(()=>{ const now=getTodayISO(); if(now!==__todayCache){ __todayCache=now; renderAll(); } }, 60*1000);
+
+const state = {
+  owners: JSON.parse(localStorage.getItem('sched:owners')||'[]'),
+  owner: localStorage.getItem('sched:owner') || (()=>{ const owners = JSON.parse(localStorage.getItem('sched:owners')||'[]'); return owners.length > 0 ? owners[0] : ''; })(),
+  startByOwner: (()=>{ try{ const raw = localStorage.getItem('sched:startByOwner'); if(raw) return JSON.parse(raw); return {}; }catch{ return {}; } })(),
+  tasks: (()=>{ 
+    try{
+      const raw = localStorage.getItem('sched:tasks'); if(!raw) return [];
+      const arr = JSON.parse(raw);
+      return (Array.isArray(arr)?arr:[]).map(t=>{
+        const workType = t.workType || (t.parallel ? '간단수정' : 'NEW');
+        return {
+          id: t.id || uid(),
+          owner: t.owner || '',
+          name: t.name || 'Untitled',
+          duration: (t.duration>0?t.duration:1),
+          extraDays: Number.isFinite(t.extraDays)? t.extraDays : 0,
+          pd: t.pd || '',
+          workType,
+          parallel: workType==='간단수정',
+          group: (workType==='간단수정') ? (t.group || null) : null,
+          planned: !!t.planned,
+          inProgress: !!t.inProgress,
+          completed: !!t.completed,
+          startedAt: t.startedAt || null,
+          completedAt: t.completedAt || null,
+          spentDays: Number.isFinite(t.spentDays) ? t.spentDays : 0,
+          activeSinceISO: t.activeSinceISO || null
+        };
+      });
+    }catch{ return []; } 
+  })(),
+  reports: (()=>{ try{ const raw = localStorage.getItem('sched:reports'); const arr = raw? JSON.parse(raw) : []; return Array.isArray(arr)? arr : []; }catch{ return []; } })(),
+  holds:   (()=>{ try{ const raw = localStorage.getItem('sched:holds');   const arr = raw? JSON.parse(raw) : []; return Array.isArray(arr)? arr : []; }catch{ return []; } })(),
+  reportTabKey: (new Date().getMonth()+1).toString()
+};
+
+function buildPayload(){ return { owners: state.owners, startByOwner: state.startByOwner, tasks: state.tasks, reports: state.reports, holds: state.holds }; }
+
+const saveNow = async ()=>{
+  try{
+    if(!CAN_EDIT){ setStatus('읽기 전용(저장 불가)'); return; }
+    const payload = buildPayload();
+    const cur = JSON.stringify(payload);
+    if(cur===lastSavedJSON){ setStatus('변경 없음'); return; }
+    setStatus('저장 중…'); await jsonbinPut(payload);
+    lastSavedJSON = cur;
+    localStorage.setItem('sched:owners', JSON.stringify(state.owners));
+    localStorage.setItem('sched:owner', state.owner);
+    localStorage.setItem('sched:startByOwner', JSON.stringify(state.startByOwner));
+    localStorage.setItem('sched:tasks', JSON.stringify(state.tasks));
+    localStorage.setItem('sched:reports', JSON.stringify(state.reports));
+    localStorage.setItem('sched:holds', JSON.stringify(state.holds));
+    setStatus('저장됨');
+  }catch(e){ console.error(e); setStatus('저장 실패'); }
+};
+
+const saveNowAuto = debounce(async ()=>{
+  try{
+    const payload = buildPayload();
+    const cur = JSON.stringify(payload);
+    if(cur===lastSavedJSON) return;
+    localStorage.setItem('sched:owners', JSON.stringify(state.owners));
+    localStorage.setItem('sched:owner', state.owner);
+    localStorage.setItem('sched:startByOwner', JSON.stringify(state.startByOwner));
+    localStorage.setItem('sched:tasks', JSON.stringify(state.tasks));
+    localStorage.setItem('sched:reports', JSON.stringify(state.reports));
+    localStorage.setItem('sched:holds', JSON.stringify(state.holds));
+    if(CAN_EDIT){
+      setStatus('자동 저장 중…'); await jsonbinPut(payload);
+      lastSavedJSON = cur; setStatus('저장됨');
+    }else{ setStatus('오프라인: 로컬 저장됨'); }
+  }catch(e){ console.warn(e); setStatus('자동 저장 실패'); }
+}, 200);
+
+/* =========================
+ * 진행/잔여 계산
+ * ========================= */
+let __lastTopId = null;
+function syncTopProgress(newTopId){ __lastTopId = newTopId || null; }
+
+function effectiveDuration(t){
+  const total = (t.duration || 0) + (t.extraDays || 0);
+  let progress = 0;
+  if (!t.planned && !t.completed && t.startedAt) {
+    const s = parseISO(t.startedAt);
+    const e = parseISO(viewTodayISO()); // TEST 모드일 때는 가짜 오늘로 진행률 시뮬
+    progress = Math.min(total, Math.max(0, bizDaysBetween(s, e)));
+  }
+  const remain = Math.max(0, total - progress);
+  return { total, progress, remain };
+}
+
+// 스케줄 산출 + 지연 처리 (완료일 당일 금지 + 배정블록 고정)
+function computeSchedule(tasks, startISO, activeTopId){
+  let cursor = parseISO(startISO);
+  bumpToBiz(cursor);
+
+  // ✅ 완료일 당일에는 어떤 작업도 시작하지 않게 강제
+  const cdISO = state.cooldownByOwner?.[state.owner];
+  if (cdISO){
+    const cd = parseISO(cdISO);  // (다음 영업일)
+    if (cursor < cd) cursor = new Date(cd);
+  }
+
+  const planned = [];
+  const byId = new Map();
+
+  for (const t of tasks){
+    // 자식(간단수정)은 부모 블록 그대로 따라감
+    const hasValidAnchor = !!(t.group && byId.get(t.group));
+    if (hasValidAnchor){
+      const anchor = byId.get(t.group);
+      const start = new Date(anchor.start);
+      const end   = new Date(anchor.end);
+      const meta  = (isSimple(t) ? {...anchor.meta, mirrorsParent:true} : anchor.meta);
+      const row = {...t, start, end, meta};
+      planned.push(row);
+      byId.set(t.id, row);
+      continue;
+    }
+
+    bumpToBiz(cursor);
+    const start = new Date(cursor);
+
+    const isTop = t.id === activeTopId;
+    const meta  = effectiveDuration(t);
+
+    const todayD = parseISO(viewTodayISO());
+    const expectedEnd = addBizDays(start, Math.max(0, (meta.total||0) - 1));
+
+    // ✅ 기본은 항상 '배정 종료일' 고정
+    let end = expectedEnd;
+    let overdueDays = 0;
+
+    // ✅ 배정 초과 시에만, 오늘까지 뒤로 늘려서 '밀림'
+    if (isTop && !t.completed && !t.planned && (todayD > expectedEnd)){
+      overdueDays = bizDaysBetween(addBizDays(expectedEnd, 1), todayD);
+      end = new Date(todayD);
+    }
+
+    const nextStart = addBizDays(end, 1);
+
+    const row = {...t, start, end, meta:{...meta, expectedEnd, overdueDays}};
+    planned.push(row);
+    byId.set(t.id, row);
+    cursor = new Date(nextStart);
+  }
+
+  return planned;
+}
+
+
+
+function finishTaskBlockAndReschedule(taskLike, completedISO){
+  const parent = state.tasks.find(x=>x.id===taskLike.id);
+  if(!parent) return;
+
+  // 부모+자식 묶음
+  const ids   = collectDescendantIds(state.tasks, parent.id);
+  const block = state.tasks.filter(x=> ids.has(x.id));
+
+  // 완료 기준일: 전달값 > 테스트 오늘 > 실제 오늘
+  const todayISO = completedISO || viewTodayISO();
+  const todayD   = parseISO(todayISO);
+
+  // === 완료 직전의 스케줄을 "현재 기준"으로 다시 계산해서,
+  //     해당 parent row의 meta.total / meta.overdueDays를 그대로 사용 ===
+  const startBase = state.startByOwner[state.owner] || viewTodayISO();
+  const visible   = state.tasks.filter(t=> t.owner === state.owner);
+  const firstActiveMain = visible.find(t=> !t.group && !t.completed && !t.planned);
+  const progressingId   = firstActiveMain ? firstActiveMain.id : null;
+  const plannedNow      = computeSchedule(visible, startBase, progressingId);
+
+  const parentRow = plannedNow.find(p => p.id === parent.id);
+  // 안전장치: 못 찾으면 직접 재계산
+  const plannedTotalParent = parentRow?.meta?.total ?? ((parent.duration||0)+(parent.extraDays||0));
+  const overdueParent      = parentRow?.meta?.overdueDays ?? (()=>{
+    const startISO = parent.startedAt || startBase;
+    const expEnd   = addBizDays(parseISO(startISO), Math.max(0, plannedTotalParent-1));
+    return Math.max(0, bizDaysBetween(addBizDays(expEnd,1), todayD));
+  })();
+
+  // --- 리포트 기록 (부모=실사용일, 자식=배정일, 간단수정=문자) ---
+block.forEach(it => {
+  // 1) 간단수정은 숫자 대신 텍스트
+  if (it.workType === '간단수정') {
+    state.reports.push({
+      id: uid(),
+      owner: it.owner,
+      name: it.name,
+      pd: it.pd || '',
+      usedDays: '간단수정',
+      month: (todayD.getMonth() + 1),
+      completedAt: todayISO
+    });
+    return;
+  }
+
+  // 2) 부모(선행)만 “실사용일(영업일)”로 기록 => 오버(+)/언더(-) 자동 반영
+  if (it.id === parent.id) {
+    const parentRow = plannedNow.find(p => p.id === it.id);
+
+    // 실제 시작 anchor: activeSinceISO > startedAt > (플랜된 start) 순으로 신뢰
+    const startAnchor =
+      it.activeSinceISO ? parseISO(it.activeSinceISO)
+      : it.startedAt    ? parseISO(it.startedAt)
+      : parentRow?.start ? new Date(parentRow.start)
+      : todayD; // 최후 방어
+
+    // 포함-포함 영업일 카운트 (같은 날 시작/완료면 1일)
+    let actualUsed = bizDaysBetween(startAnchor, todayD);
+
+    // 필요하면 “같은 날은 0일로 취급” 원한다면 아래 한 줄 주석 해제
+    // actualUsed = Math.max(0, actualUsed - 1);
+
+    state.reports.push({
+      id: uid(),
+      owner: it.owner,
+      name: it.name,
+      pd: it.pd || '',
+      usedDays: Math.max(0, actualUsed),
+      month: (todayD.getMonth() + 1),
+      completedAt: todayISO
+    });
+  } else {
+    // 3) 자식/동시작업(간단수정 제외)은 “배정일”만 기록 (오버는 부모에만 반영)
+    const childRow   = plannedNow.find(p => p.id === it.id);
+    const childTotal = childRow?.meta?.total ?? ((it.duration || 0) + (it.extraDays || 0));
+    state.reports.push({
+      id: uid(),
+      owner: it.owner,
+      name: it.name,
+      pd: it.pd || '',
+      usedDays: Math.max(0, childTotal),
+      month: (todayD.getMonth() + 1),
+      completedAt: todayISO
+    });
+  }
+});
+
+
+
+  // 완료된 묶음 제거
+  if (ids.has(__lastTopId)) __lastTopId = null;
+  state.tasks = state.tasks.filter(x=> !ids.has(x.id));
+
+  // 다음 기준일 = 완료 '다음' 영업일 (완료 당일은 비움)
+  const nextStart = toISO(addBizDays(todayD, 1));
+  state.startByOwner[state.owner] = nextStart;
+
+  // 저장/렌더
+  localStorage.setItem('sched:startByOwner', JSON.stringify(state.startByOwner));
+  localStorage.setItem('sched:tasks', JSON.stringify(state.tasks));
+  localStorage.setItem('sched:reports', JSON.stringify(state.reports));
+  state.reportTabKey = String(todayD.getMonth()+1);
+
+  renderAll();
+  saveNowAuto();
+}
+
+
+
+
+/* =========================
+ * Telegram (원본 유지)
+ * ========================= */
+const TELEGRAM_BOT_TOKEN = "8479716195:AAGzTK4YRcUojESzOvI-79YZurBjgkdjItk";
+const TELEGRAM_CHAT_ID   = "421516816";
+const PD_CHAT_MAP = { "김정용": "421516816" };
+
+function parsePDs(pdStr){
+  return (pdStr||"").replace(/PD[:：]?\s*/gi, "")
+    .split(/[,\/*|·]+|\s{2,}/g).map(s=>s.trim()).filter(Boolean);
+}
+async function sendTelegramMessage(text, chatId){
+  if(!TELEGRAM_BOT_TOKEN || !chatId) return;
+  try{
+    await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: "POST", headers: { "Content-Type":"application/json" },
+      body: JSON.stringify({ chat_id: chatId, text })
+    });
+  }catch(_e){}
+}
+function sendToPDs(pdStr, text){
+  const uniq = new Set();
+  parsePDs(pdStr).forEach(name=>{
+    const id = getPDChatIdFromStorage(name) || PD_CHAT_MAP[name];
+    if(id) uniq.add(id);
+  });
+  uniq.forEach(id=> sendTelegramMessage(text, id));
+}
+const PD_CHAT_STORAGE_KEY = 'sched:pdchats';
+function getPDChatMap(){ try{ return JSON.parse(localStorage.getItem(PD_CHAT_STORAGE_KEY)||'{}'); }catch{ return {}; } }
+function getPDChatIdFromStorage(name){ const map = getPDChatMap(); return map[name] || ''; }
+function setPDChatIdToStorage(name, id){ const map = getPDChatMap(); map[name] = id; localStorage.setItem(PD_CHAT_STORAGE_KEY, JSON.stringify(map)); }
+
+const QUIET_WINDOW = { startMin: 9*60, endMin: 18*60 };
+function isBusinessHour(now = new Date()){
+  if (!isBiz(now)) return false;
+  const minutes = now.getHours()*60 + now.getMinutes();
+  return minutes >= QUIET_WINDOW.startMin && minutes < QUIET_WINDOW.endMin;
+}
+async function sendTelegramMessageAuto(text, chatId){
+  if (!isBusinessHour()){
+    console.log('[TG] Quiet hours/holiday/weekend: 자동 알림 생략', text);
+    return;
+  }
+  return sendTelegramMessage(text, chatId);
+}
+function sendToPDsAuto(pdStr, text){
+  if (!isBusinessHour()){
+    console.log('[TG] Quiet hours/holiday/weekend: 자동 알림 생략', text);
+    return;
+  }
+  sendToPDs(pdStr, text);
+}
+function oneLineLeadMsg(leadName, dateISO){ return `📣 스케줄 변경 | '${leadName}' 선행. 예정일 ${dateISO}. 편성에 지장이 있을시 제작2국 조정현국장에게 문의하세요.`; }
+function oneLineDelayMsg(leadName, delayedName, newDateISO){ return `📣 스케줄 변경 | '${leadName}' 선행으로 '${delayedName}' 지연. 예정일 ${newDateISO}. 편성에 지장이 있을시 제작2국 조정현국장에게 문의하세요.`; }
+function oneLineSwapDelayedMsg(advName){ return `📣 순서 변경 | '${advName}' 작업이 먼저 진행됩니다. 편성에 영향이 있을시 제작2국 조정현국장에게 문의하세요.`; }
+function oneLineSwapAdvanceMsg(delayedName){ return `📣 순서 변경 | 조정현국장의 요청에 의해 '${delayedName}'보다 먼저 진행됩니다.`; }
+const TELEGRAM_SVG = `
+  <svg class="tg-ic" viewBox="0 0 24 24" aria-hidden="true">
+    <path fill="currentColor" d="M22 3L2.6 10.1c-.9.35-.88 1.63.03 1.95l5.33 1.9 1.98 6.04c.26.79 1.25.98 1.8.36l3.25-3.6 5.23 3.69c.73.51 1.75.12 1.95-.78L23.98 4.1C24.2 3.1 23.1 2.5 22 3Zm-7.78 12.46-2.65 2.93-.96-2.94 8.41-8.07-10.8 6.4-3.06-1.1L21 5.6l-6.78 9.86Z"/>
+  </svg>
+`;
+</script>
+
+<style>
+  :root{
+    --bg:#f6f8fb; --card:#fff; --line:#e5e7eb; --text:#111827; --muted:#6b7280;
+    --accent:#1f2937; --pill:#eef2ff; --weekend:#fef3c7; --holiday:#fee2e2;
+    --good:#10b981; --good-text:#065f46; --bad:#dc2626; --tg:#229ED9;
+  }
+  html, body { max-width:100%; overflow-x:hidden; }
+  body{font-family:system-ui,Segoe UI,Apple SD Gothic Neo,Apple Color Emoji,Arial,sans-serif;background:var(--bg);color:var(--text);margin:0;padding:24px;}
+  .wrap{max-width:1100px;margin:0 auto;display:grid;gap:16px;}
+  .row{display:grid;gap:10px;}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;box-shadow:0 2px 8px rgba(0,0,0,.03)}
+  header{display:flex;justify-content:space-between;align-items:flex-end;gap:12px;flex-wrap:wrap;}
+  h1{font-size:20px;margin:0}
+  .muted{color:var(--muted);font-size:12px}
+  .controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+  .input, .btn, select.input{border:1px solid var(--line);border-radius:10px;padding:10px 12px;background:#fff}
+  .btn{cursor:pointer}
+  .btn[disabled]{cursor:not-allowed; opacity:.9}
+  .btn.primary{ background:#1f2937; color:#fff; border-color:#1f2937; }
+  .btn.hold{ border-color:#9ca3af; color:#374151; background:#fff; }
+  .btn.danger{ border-color:#ef4444; color:#991b1b; background:#fee2e2; }
+  .btn.go{ border-color: var(--good); color: var(--good-text); background:#ecfdf5; }
+
+  .btn.msg-btn{
+    background: var(--tg);
+    color:#fff;
+    border-color: var(--tg);
+    display:inline-flex;
+    align-items:center;
+    gap:6px;
+    padding: 8px 8px;
+    line-height: 1;
+    border-radius: 8px;
+  }
+  .btn.msg-btn .tg-ic{ width:16px; height:16px; display:inline-block; flex:0 0 auto; }
+
+  .grid-head, .row-item{ display:grid; grid-template-columns:5fr 1.8fr 1.6fr 1.8fr; align-items:center; }
+  .grid-head{background:#f3f4f6; font-size:13px; font-weight:600; border-bottom:1px solid var(--line);}
+  .cell{padding:10px;}
+  .row-item{ border-bottom:1px solid var(--line); }
+  .row-item:hover{background:#fafafa}
+  .row-item.dragover{outline:2px dashed #9ca3af;background:#f9fafb}
+  .drag{color:#9ca3af;user-select:none;cursor:grab}
+
+  .row-item.inprogress, .row-item.completed{position:relative;}
+  .row-item.completed::after{ content:""; position:absolute; left:0; right:0; top:50%; height:1px; background:var(--good); transform:translateY(-.5px); pointer-events:none; }
+.row-item.completed{
+  background:#f3f4f6;      /* 회색 배경 */
+  color:#6b7280;           /* 텍스트 회색 */
+  opacity:1;               /* 불투명 */
+  filter:grayscale(1);     /* 전체 회색톤 */
+  position:relative;
+}
+.row-item.completed::after{
+  content:""; position:absolute; left:0; right:0; top:50%; height:1px;
+  background:#9ca3af; transform:translateY(-.5px); pointer-events:none; /* 중간 라인도 회색 */
+}
+
+.row-item.completed .input,
+.row-item.completed .workTypeSel,
+.row-item.completed .btn,
+.row-item.completed .iconbtn,
+.row-item.completed select,
+.row-item.completed input{
+  pointer-events:none !important;  /* 완전 비활성화 */
+  opacity:.55;                     /* 흐리게 */
+}
+
+.row-item.completed .drag{visibility:hidden}
+
+/* 달력 라벨/점도 완료면 흐리게 표시할 준비 */
+.taskdot.done .dot{ opacity:.4; filter:grayscale(1); }
+.taskdot.done span{ opacity:.6; filter:grayscale(1); }
+.dot.done{ opacity:.4; filter:grayscale(1); }
+
+
+  .status-pill{ display:inline-block; margin-left:6px; padding:2px 6px; border-radius:999px; font-size:11px; line-height:1; border:1px solid var(--line); }
+  .status-pill.pending{ background:#fee2e2; color:#991b1b; border-color:#fecaca; }
+  .status-pill.inprogress{ background:#d1fae5; color:#065f46; border-color:#a7f3d0; }
+  .status-pill.completed{ background:#ecfdf5; color:#065f46; border-color:#a7f3d0; }
+  .status-pill.concurrent{ background:#dbeafe; color:#1e40af; border-color:#bfdbfe; }
+
+  .badge-plan{ margin-left:6px; padding:2px 6px; border-radius:999px; font-size:11px; line-height:1; background:#fee2e2; color:#991b1b; border:1px solid #fecaca; }
+  .badge-concurrent{ margin-left:6px; padding:2px 6px; border-radius:999px; font-size:11px; line-height:1; background:#dbeafe; color:#1e40af; border:1px solid #bfdbfe; }
+
+  .pd{width:130px}
+  .durView{display:flex; align-items:center; gap:8px;}
+  .durText{font-variant-numeric: tabular-nums;}
+  .over{color:var(--bad); font-weight:600;}
+  .iconbtn{ display:inline-flex; align-items:center; justify-content:center; width:22px; height:22px; border:1px solid var(--line); border-radius:6px; background:#fff; font-size:12px; line-height:1; cursor:pointer; }
+  .iconbtn[disabled]{ opacity:.5; cursor:not-allowed; }
+
+  .xbtn{
+    width:18px; height:18px; padding:0; margin:0;
+    border:1px solid var(--line); background:#fff; border-radius:4px;
+    font-size:12px; line-height:16px; text-align:center; cursor:pointer;
+  }
+
+  .reports{padding:12px 16px 0 16px;}
+  .tabbar{display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px;}
+  .tabbtn{ padding:6px 10px; border:1px solid var(--line); border-radius:999px; background:#fff; cursor:pointer; font-size:12px; }
+  .tabbtn.active{ background:#111827; color:#fff; border-color:#111827; }
+  .report-table{ width:100%; border-collapse:collapse; font-size:13px; }
+  .report-table th, .report-table td{ border-bottom:1px solid var(--line); padding:8px 6px; text-align:left; }
+  .report-empty{ color:#6b7280; font-size:12px; padding:8px 2px; }
+
+  /* 달력 */
+  .calendar{padding:16px}
+  .month{margin-top:10px}
+  .month h3{margin:8px 0 6px;font-size:16px}
+  .cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:2px}
+  .dow{font-size:12px;color:#6b7280;text-align:center;padding:6px 0}
+  .day{
+    min-height:74px;background:#fff;border:1px solid var(--line);border-radius:8px;
+    padding:6px;display:grid;grid-template-rows:auto 1fr auto;row-gap:4px;
+  }
+  .day.weekend{background:#fef3c7}
+  .day.holiday{background:#fee2e2}
+  .day .date{font-size:12px;color:#374151; align-self:start; position: relative; padding-right:14px; }
+  .taskdot{display:flex;align-items:center;gap:6px;font-size:12px; align-self:start;}
+  .dot{width:8px;height:8px;border-radius:50%;background:#111827;flex:none}
+  .bar{height:3px;border-radius:3px;background:#111827;opacity:.15; align-self:end;}
+  .legend{display:flex;gap:12px;font-size:12px;color:#6b7280;padding:0 16px 12px}
+
+  /* 오늘 빨간 점 + 살짝 펄스 */
+  .day.today .date::after{
+    content:""; position:absolute; right:0; top:50%; transform:translateY(-50%);
+    width:8px; height:8px; border-radius:50%; background:#ef4444;
+    box-shadow:0 0 0 2px #fff; animation: todayPulse 1.6s ease-in-out infinite;
+  }
+  @keyframes todayPulse{ 0%{ transform:translateY(-50%) scale(1); opacity:1;}
+    70%{ transform:translateY(-50%) scale(1.25); opacity:.55;}
+    100%{ transform:translateY(-50%) scale(1); opacity:1;} }
+
+  .month.today-month > h3::after{
+    content:" · 오늘 포함"; margin-left:6px; font-size:12px; color:#ef4444; font-weight:700;
+  }
+
+  /* 모달 */
+  .modal-overlay{ position:fixed; inset:0; background:rgba(0,0,0,.35);
+    display:flex; align-items:center; justify-content:center; z-index:9999; }
+  .modal{ width:min(92vw, 380px); background:#fff; border:1px solid var(--line);
+    border-radius:12px; padding:14px; box-shadow:0 10px 30px rgba(0,0,0,.15); }
+  .modal h3{ margin:0 0 10px; font-size:16px; }
+  .modal-body{ display:grid; gap:10px; }
+  .modal-body label{ font-size:13px; color:#374151; display:grid; gap:6px; }
+  .modal-body input{ border:1px solid var(--line); border-radius:8px; padding:8px 10px; }
+  .modal-actions{ display:flex; gap:8px; justify-content:flex-end; margin-top:12px; }
+
+  /* 비번/저장 버튼은 모바일에서 숨김 */
+  @media (max-width: 1100px){ .passbox, #saveBtn { display:none !important; } }
+  .passbox{ width:100%; margin-top:8px; padding:8px; border:1px dashed var(--line); border-radius:10px; background:#fafafa; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .badge-lock{ display:inline-block; font-size:11px; padding:2px 6px; border-radius:999px; background:#fee2e2; color:#991b1b; border:1px solid #fecaca; }
+  .badge-unlock{ display:inline-block; font-size:11px; padding:2px 6px; border-radius:999px; background:#ecfdf5; color:#065f46; border:1px solid #a7f3d0; }
+  select.input option.separator { color:#9ca3af; }
+
+  /* 모바일 레이아웃 최적화 */
+  @media (max-width: 1100px) {
+    body{ padding:12px; }
+    header{ flex-direction:column; align-items:flex-start; gap:8px; }
+    h1 { font-size: 18px; }
+    .controls { gap:6px; }
+    header .controls label.muted:nth-of-type(2), header .controls #startDate { display:none !important; }
+    .reports{ display:none !important; }
+    .calendar{ padding: 8px; }
+    .calendar .legend{ display:none !important; }
+    .month h3{ font-size:14px; margin:6px 0; }
+    .dow{ font-size:11px; padding:4px 0; }
+    .day{ min-height:48px; padding:6px; grid-template-rows: auto 1fr; }
+    .taskdot, .bar{ display:none !important; }
+    .m-count{ justify-self:start; margin-top:2px; display:inline-grid; place-items:center;
+      width:22px; height:22px; border-radius:999px; border:1px solid var(--line);
+      font-size:12px; background:#fff; color:#111827; }
+    .grid-head, .row-item{ grid-template-columns: 2fr 1fr 1fr; gap: 4px; }
+    .row-item .cell{ padding:6px 4px; min-width:0; }
+    .row-item .cell:first-child{ display:flex; align-items:center; gap:6px; min-width:0; }
+    .drag { display:none; }
+    .m-line{ font-size:13px; line-height:1.35; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .namePrefix{ color:#9ca3af; margin-right:6px; }
+    .btn{ padding:4px 6px; font-size:11px; border-radius:8px; }
+    .iconbtn{ width:18px; height:18px; font-size:11px; border-radius:5px; }
+    .pd{ width:auto; min-width:120px; }
+    .pill{ font-size:11px; padding:4px 6px; white-space:nowrap; }
+    .m-date{ font-size:12px; text-align:center; margin:0 auto; display:block; color:#374151; }
+    .status-pill{ padding:2px 6px; font-size:11px; }
+    .grid-head{ display:none !important; }
+    .add-task-form { display:none !important; }
+  }
+
+  /* 색상 강조/지연일 */
+  .day.colored .date{ font-weight:700; }
+  .day .bar{ display:none !important; }
+  .day .taskdot .dot{ width:8px; height:8px; opacity:1; }
+  .day.delay{ box-shadow: inset 0 0 0 2px var(--bad); border-color: var(--bad) !important; }
+  
+  /* 데스크톱(1100px 이상)에서 NEW/수정/간단수정 select 박스를 더 작게 */
+@media (min-width: 1100px) {
+  select.input.workTypeSel {
+    width: 80px !important;   /* 기본 90px → 더 작게 */
+    padding: 1px 4px;         /* 안쪽 여백 줄임 */
+    height: 25px;             /* 높이 줄임 */
+    font-size: 12px;          /* 글자 크기 줄임 */
+    line-height: 1.2;
+    border-radius: 4px;       /* 둥근 정도 줄임 */
+  }
+}
+
+/* 액션 버튼 간격/정렬 */
+.cell.actions{
+  display: flex;
+  align-items: center;
+  gap: 8px;          /* ← 버튼 사이 간격 */
+  flex-wrap: wrap;   /* 칸이 좁을 때 줄바꿈 허용 */
+}
+
+/* 데스크톱에서 조금 더 여유 */
+@media (min-width: 1100px){
+  .cell.actions{ gap: 10px; }
+}
+
+/* 텔레그램 버튼만 살짝 간격 보정이 필요하면(선택) */
+.cell.actions .btn.msg-btn{ padding-left: 10px; padding-right: 10px; }
+
+
+
+
+
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="row card" style="padding:16px">
+    <header>
+      <div>
+        <h1>CG작업 스케줄표</h1>
+        <div class="muted" id="statusLine"></div>
+      </div>
+      <div class="controls">
+        <label class="muted">담당자</label>
+        <select id="ownerSel" class="input"></select>
+
+        <label class="muted">오늘</label>
+        <input id="startDate" type="date" class="input" disabled />
+        <button id="saveBtn" class="btn primary" style="margin-left:8px">저장</button>
+      </div>
+
+      <div class="passbox">
+        <span id="lockBadge" class="badge-lock">잠금</span>
+        <input id="editPass" type="password" class="input" style="width:160px" placeholder="편집 비밀번호" />
+        <button id="passBtn" class="btn">잠금 해제</button>
+        <button id="passOffBtn" class="btn" style="display:none;">다시 잠금</button>
+      </div>
+    </header>
+
+    <!-- === TEST PANEL (붙였다 떼기 쉬움) === -->
+    <div id="testPanel" class="test-panel" style="display:block">
+      <strong style="font-size:12px;">테스트</strong>
+      <button class="tbtn" data-jump="-5">오늘-5</button>
+      <button class="tbtn" data-jump="-1">오늘-1</button>
+      <button class="tbtn primary" id="tp-today">실제오늘</button>
+      <button class="tbtn" data-jump="+1">오늘+1</button>
+      <button class="tbtn" data-jump="+5">오늘+5</button>
+      <span class="sep">|</span>
+      <input type="date" id="tp-date">
+      <button class="tbtn" id="tp-apply">적용</button>
+      <button class="tbtn" id="tp-clear">모의해제</button>
+      <span class="sep">|</span>
+      <button class="tbtn" id="tp-sample">샘플작업 추가</button>
+      <button class="tbtn danger" id="tp-wipe">현재 사용자 작업 삭제</button>
+    </div>
+
+    <script>
+    /* === TEST PANEL JS === */
+    (function(){
+      const pad = n => String(n).padStart(2,'0');
+      const toISO = (d)=>{ const x=new Date(d); x.setHours(0,0,0,0); return `${x.getFullYear()}-${pad(x.getMonth()+1)}-${pad(x.getDate())}`; };
+      const parseISO = (s)=>{ const [y,m,d]=s.split('-').map(Number); const x=new Date(y, m-1, d); x.setHours(0,0,0,0); return x; };
+      const addDaysISO = (iso, delta)=> toISO(new Date(parseISO(iso).getTime() + delta*86400000));
+      const $ = (sel)=>document.querySelector(sel);
+      const root = $('#testPanel');
+      if(!root) return;
+
+      // 테스트 스위치 ON
+      window.__TEST_MODE__ = true;
+
+      function currentBaseISO(){ return getTodayISO(); }
+
+      function applyMock(iso){
+        window.__FORCE_TODAY__ = iso;   // ✅ 오직 화면/엔진의 "오늘"만 변경
+        // ❌ baseline(startByOwner)은 건드리지 않음
+        renderAll();
+      }
+      function clearMock(){
+        delete window.__FORCE_TODAY__;
+        renderAll();
+      }
+
+      root.querySelectorAll('.tbtn[data-jump]').forEach(btn=>{
+        btn.addEventListener('click', ()=>{
+          const dj = parseInt(btn.getAttribute('data-jump'),10);
+          const next = addDaysISO(currentBaseISO(), dj);
+          applyMock(next);
+          const inp = $('#tp-date'); if(inp) inp.value = next;
+        }, {passive:true});
+      });
+
+      $('#tp-today')?.addEventListener('click', ()=>{
+        const real = getRealTodayISO();
+        applyMock(real);
+        const inp = $('#tp-date'); if(inp) inp.value = real;
+      }, {passive:true});
+
+      $('#tp-apply')?.addEventListener('click', ()=>{
+        const v = ($('#tp-date')?.value||'').trim();
+        if(!/^\d{4}-\d{2}-\d{2}$/.test(v)) { alert('날짜를 선택하세요 (YYYY-MM-DD)'); return; }
+        applyMock(v);
+      }, {passive:true});
+
+      $('#tp-clear')?.addEventListener('click', ()=>{
+        clearMock();
+        const inp = $('#tp-date'); if(inp) inp.value = '';
+      }, {passive:true});
+
+      $('#tp-sample')?.addEventListener('click', ()=>{
+        if(!state || !state.owner) return alert('사용자가 없습니다.');
+        const base = getTodayISO();
+        const t = {
+          id: 'sample-'+Math.random().toString(36).slice(2,9),
+          owner: state.owner,
+          name: '샘플작업 '+base,
+          duration: 2,
+          extraDays: 0,
+          pd: '김정용',
+          workType: 'NEW',
+          parallel: false,
+          group: null,
+          planned: true,
+          inProgress: false,
+          completed: false,
+          startedAt: null,
+          completedAt: null,
+          spentDays: 0,
+          activeSinceISO: null
+        };
+        state.tasks.push(t);
+        localStorage.setItem('sched:tasks', JSON.stringify(state.tasks));
+        renderAll(); saveNowAuto();
+      }, {passive:true});
+
+      $('#tp-wipe')?.addEventListener('click', ()=>{
+        if(!state || !state.owner) return;
+        if(!confirm(`"${state.owner}"의 작업을 모두 삭제할까요?`)) return;
+        state.tasks = state.tasks.filter(x=> x.owner !== state.owner);
+        localStorage.setItem('sched:tasks', JSON.stringify(state.tasks));
+        renderAll(); saveNowAuto();
+      }, {passive:true});
+
+      const ini = currentBaseISO();
+      const inp = $('#tp-date'); if(inp) inp.value = ini;
+    })();
+    </script>
+
+    <!-- 데스크톱 작업 추가 폼 -->
+    <div class="controls add-task-form">
+      <input id="taskName" class="input" placeholder="작업 이름" />
+      <input id="taskPD" class="input pd" placeholder="담당 PD" />
+      <input id="taskDur" class="input" type="number" min="1" value="1" style="width:120px" />
+      <select id="taskType" class="input" style="width:100px">
+        <option value="NEW">NEW</option>
+        <option value="수정">수정</option>
+        <option value="간단수정">간단수정</option>
+        <option value="전체수정">전체수정</option>
+      </select>
+      <label class="chk"><input id="taskPlanned" type="checkbox" class="toggle" />예정</label>
+      <button id="addBtn" class="btn primary">추가</button>
+    </div>
+  </div>
+
+  <!-- 리포트/보류 -->
+  <div id="reportsCard" class="row card reports">
+    <div id="reportTabs" class="tabbar"></div>
+    <div id="reportPanel"></div>
+  </div>
+
+  <div class="row card">
+    <div class="grid-head">
+      <div class="cell header-task">작업내용 / 담당 PD</div>
+      <div class="cell header-dur">기간(일)</div>
+      <div class="cell header-start">예정시작</div>
+      <div class="cell header-act">진행상태</div>
+    </div>
+    <div id="taskRows"></div>
+  </div>
+
+  <div class="row card calendar">
+    <div class="legend">
+      <span><span class="sw weekend" style="display:inline-block;width:12px;height:12px;border:1px solid var(--line);border-radius:3px;background:#fef3c7;vertical-align:-2px;margin-right:6px"></span>주말</span>
+      <span><span class="sw holiday" style="display:inline-block;width:12px;height:12px;border:1px solid var(--line);border-radius:3px;background:#fee2e2;vertical-align:-2px;margin-right:6px"></span>공휴일</span>
+    </div>
+    <div id="calendarMount"></div>
+  </div>
+</div>
+
+<div id="modalHost"></div>
+
+<script>
+/* =========================
+ * 드롭다운(사용자 추가/삭제)
+ * ========================= */
+function renderOwnerDropdown(){
+  const sel = $('#ownerSel');
+  sel.innerHTML = '';
+
+  state.owners.forEach(name=>{
+    const opt = document.createElement('option');
+    opt.value = name;
+    opt.textContent = name;
+    sel.appendChild(opt);
+  });
+
+  if (!isMobileView()){
+    const sep = document.createElement('option');
+    sep.disabled = true; sep.className = 'separator'; sep.textContent = '──────────';
+    sel.appendChild(sep);
+
+    const add = document.createElement('option'); add.value = '__add__'; add.textContent = '➕ 사용자 추가…'; sel.appendChild(add);
+    const del = document.createElement('option'); del.value = '__delete__'; del.textContent = '🗑️ 사용자 삭제…'; sel.appendChild(del);
+  }
+
+  if (state.owners.includes(state.owner)) sel.value = state.owner;
+  else { state.owner = state.owners[0] || ''; sel.value = state.owner; }
+}
+
+/* =========================
+ * 달력 헬퍼
+ * ========================= */
+function buildDateMap(rows){
+  const map=new Map();
+  for(const r of rows){
+    if(!r.start) continue;
+    let d=new Date(r.start);
+    while(d<=r.end){
+      if(isBiz(d)){
+        const key=toISO(d);
+        if(!map.has(key)) map.set(key,{list:[],firstId:null});
+        const obj=map.get(key);
+        obj.list.push({id:r.id,name:r.name,pd:r.pd||'', completed: !!r.completed});
+
+        if(!obj.firstId) obj.firstId=r.id;
+      }
+      d.setDate(d.getDate()+1);
+    }
+  }
+  return map;
+}
+
+/* =========================
+ * 달력 렌더
+ * ========================= */
+function renderCalendar(planned, owner, activeTopId){
+  const mount = $('#calendarMount');
+  mount.innerHTML = '';
+
+  const filtered = planned.filter(p => p.start);
+
+  // ✅ 작업이 없어도 달력은 항상 렌더: 현재 달을 기본 범위로 사용
+  const todayISO = getTodayISO();
+  const todayD   = parseISO(todayISO);
+  const defaultStart = new Date(todayD.getFullYear(), todayD.getMonth(), 1);
+  const defaultEnd   = new Date(todayD.getFullYear(), todayD.getMonth()+1, 0);
+  const noTasks = filtered.length === 0;
+
+  // (선택) 안내 문구만 보여주고, 달력 자체는 계속 그림
+  if (noTasks){
+    const info = document.createElement('div');
+    info.className = 'muted';
+    info.style.margin = '0 0 6px 2px';
+    info.textContent = '작업이 없습니다. (달력은 현재 달로 표시됩니다)';
+    mount.appendChild(info);
+  }
+
+  // 지연일(빨간 테두리) 계산은 기존 그대로
+  const delaySet = new Set();
+  if (activeTopId){
+    const top = planned.find(p => p.id === activeTopId);
+    if (top && top.meta && top.meta.overdueDays > 0){
+      const today = parseISO(getTodayISO());
+      const expEnd = top.meta.expectedEnd instanceof Date
+        ? top.meta.expectedEnd
+        : parseISO(toISO(top.meta.expectedEnd));
+      let cur = addBizDays(expEnd, 1);
+      while(cur <= today){
+        if(isBiz(cur)) delaySet.add(toISO(cur));
+        cur.setDate(cur.getDate()+1);
+      }
+    }
+  }
+
+  // 범위 월 구성: 작업 없으면 현재 달 사용
+  let months = [];
+  const minStart = noTasks
+    ? defaultStart
+    : filtered.reduce((d, r) => (r.start < d ? r.start : d), filtered[0].start);
+  const maxEnd = noTasks
+    ? defaultEnd
+    : filtered.reduce((d, r) => (r.end > d ? r.end : d), filtered[0].end);
+
+  const minDate = new Date(minStart);
+  const maxDate = new Date(maxEnd);
+  const iter = new Date(minDate.getFullYear(), minDate.getMonth(), 1);
+  const last = new Date(maxDate.getFullYear(), maxDate.getMonth(), 1);
+  while (iter <= last){ months.push(new Date(iter)); iter.setMonth(iter.getMonth() + 1); }
+
+  const dateMap = buildDateMap(filtered);
+  const MONTH_NAMES = ['1월','2월','3월','4월','5월','6월','7월','8월','9월','10월','11월','12월'];
+  const DOW = ['일','월','화','수','목','금','토'];
+
+  months.forEach(m0 => {
+    const y = m0.getFullYear(), m = m0.getMonth();
+
+    const box = document.createElement('div');
+    box.className = 'month';
+    // CSS에 .month.today-month > h3::after 스타일이 있으므로 표시를 위해 클래스 부여
+    if (y === todayD.getFullYear() && m === todayD.getMonth()){
+      box.classList.add('today-month');
+    }
+    box.innerHTML = `<h3>${y}년 ${MONTH_NAMES[m]} — ${owner}</h3>`;
+
+    const head = document.createElement('div');
+    head.className = 'cal-grid';
+    DOW.forEach(d => {
+      const el = document.createElement('div');
+      el.className = 'dow';
+      el.textContent = d;
+      head.appendChild(el);
+    });
+    box.appendChild(head);
+
+    const grid = document.createElement('div'); grid.className = 'cal-grid';
+    const firstDay = new Date(y, m, 1);
+    for (let i = 0; i < firstDay.getDay(); i++){ grid.appendChild(document.createElement('div')); }
+
+    const daysInMonth = new Date(y, m + 1, 0).getDate();
+    for (let d = 1; d <= daysInMonth; d++){
+      const cur = new Date(y, m, d); cur.setHours(0,0,0,0);
+      const iso = toISO(cur);
+
+      const cell = document.createElement('div');
+      cell.className = 'day' + (isWeekend(cur) ? ' weekend' : '') + (isHoliday(cur) ? ' holiday' : '');
+
+      const dateEl = document.createElement('div');
+      dateEl.className = 'date';
+      dateEl.textContent = d + (isHoliday(cur) ? ' 🎌' : '');
+      cell.appendChild(dateEl);
+
+      if (toISO(cur) === todayISO){ cell.classList.add('today'); }
+
+      if (delaySet.has(iso) && !cell.classList.contains('weekend') && !cell.classList.contains('holiday')){
+        cell.classList.add('delay');
+      }
+
+      const info = dateMap.get(iso);
+      if (info){
+        const isBizDay = !isWeekend(cur) && !isHoliday(cur);
+        if (isBizDay){
+          const first = info.list[0];
+          const color = getProjectColor(first.id);
+          const textColor = getContrastText(color);
+
+          cell.classList.add('colored');
+          cell.style.background = color;
+          cell.style.borderColor = color;
+          dateEl.style.color = textColor;
+
+          if (isMobileView()){
+            const row = document.createElement('div');
+            row.className = 'proj-row';
+            info.list.forEach(() => {
+              const dot = document.createElement('span');
+              dot.className = 'dot';
+              dot.style.background = textColor;
+              dot.style.display = 'inline-block';
+              row.appendChild(dot);
+            });
+            cell.appendChild(row);
+          } else {
+            info.list.forEach(item => {
+              const line = document.createElement('div');
+              line.className = 'taskdot';
+              const dot = document.createElement('span'); dot.className = 'dot'; dot.style.background = textColor;
+              const label = document.createElement('span'); label.style.color = textColor;
+              label.textContent = item.pd ? `${item.name} (${item.pd})` : item.name;
+              line.appendChild(dot); line.appendChild(label); cell.appendChild(line);
+            });
+          }
+          cell.title = info.list.map(x => x.pd ? `${x.name} (${x.pd})` : x.name).join('\n');
+        }
+      }
+      grid.appendChild(cell);
+    }
+    box.appendChild(grid);
+    mount.appendChild(box);
+  });
+}
+
+
+/* =========================
+ * 리포트/보류 렌더
+ * ========================= */
+function renderReports(){
+  const tabs = $('#reportTabs');
+  const panel = $('#reportPanel');
+  tabs.innerHTML=''; panel.innerHTML='';
+
+  const nowKey = (new Date().getMonth()+1).toString();
+  if(!state.reportTabKey) state.reportTabKey = nowKey;
+
+  for(let m=1;m<=12;m++){
+    const key = m.toString();
+    const b = document.createElement('button');
+    b.className = 'tabbtn'+(key===state.reportTabKey?' active':'' );
+    b.textContent = `${m}월`;
+    b.addEventListener('click', ()=>{ state.reportTabKey = key; renderReports(); }, {passive:true});
+    tabs.appendChild(b);
+  }
+  const holdBtn = document.createElement('button');
+  holdBtn.className = 'tabbtn'+(state.reportTabKey==='hold'?' active':'' );
+  holdBtn.textContent = '보류프로젝트';
+  holdBtn.addEventListener('click', ()=>{ state.reportTabKey='hold'; renderReports(); }, {passive:true});
+  tabs.appendChild(holdBtn);
+
+  if(state.reportTabKey==='hold'){
+    const list = state.holds.filter(h=> h.owner===state.owner);
+    if(!list.length){ panel.innerHTML = '<div class="report-empty">보류 중인 프로젝트가 없습니다.</div>'; return; }
+    const rows = list.map(h=>`
+      <tr data-id="${h.id}">
+        <td>${(h.name||'').replace(/</g,'&lt;')}</td>
+        <td>${(h.pd||'').replace(/</g,'&lt;')}</td>
+        <td style="white-space:nowrap; display:flex; gap:6px; align-items:center;">
+          <button class="btn primary hold-resume">작업재개</button>
+          <button class="btn delete hold-delete">삭제</button>
+        </td>
+      </tr>`).join('');
+    panel.innerHTML = `
+      <table class="report-table">
+        <thead><tr><th>작업내용</th><th>담당 PD</th><th>액션</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+    panel.querySelectorAll('.hold-resume').forEach(btn=>{
+      btn.addEventListener('click', ()=>{
+        if(!canEdit()) return;
+        const tr = btn.closest('tr');
+        const id = tr.getAttribute('data-id');
+        const idx = state.holds.findIndex(h=>h.id===id && h.owner===state.owner);
+        if(idx>=0){
+          const task = {...state.holds[idx]};
+          task.planned = true; task.inProgress=false; task.completed=false;
+          task.startedAt=null; task.completedAt=null; delete task.heldAt;
+          state.tasks.push(task); state.holds.splice(idx,1);
+          localStorage.setItem('sched:tasks', JSON.stringify(state.tasks));
+          localStorage.setItem('sched:holds', JSON.stringify(state.holds));
+          state.reportTabKey = (new Date().getMonth()+1).toString();
+          renderAll(); saveNowAuto();
+          alert('재개되었습니다. 메인 목록의 "작업시작" 버튼으로 시작일을 설정하세요.');
+        }
+      }, {passive:true});
+    });
+    panel.querySelectorAll('.hold-delete').forEach(btn=>{
+      btn.addEventListener('click', ()=>{
+        if(!canEdit()) return;
+        const tr = btn.closest('tr'); const id = tr.getAttribute('data-id');
+        const idx = state.holds.findIndex(h=>h.id===id && h.owner===state.owner);
+        if(idx>=0){
+          if(!confirm('보류 항목을 삭제할까요?')) return;
+          state.holds.splice(idx,1);
+          localStorage.setItem('sched:holds', JSON.stringify(state.holds));
+          renderReports(); saveNowAuto();
+        }
+      }, {passive:true});
+    });
+    return;
+  }
+
+  const monthNum = parseInt(state.reportTabKey,10);
+  const list = state.reports.filter(r=> r.owner===state.owner && r.month===monthNum);
+  if(!list.length){
+    panel.innerHTML = '<div class="report-empty">이 달의 완료 작업이 없습니다.</div>';
+    return;
+  }
+  const rows = list.map(r=>`
+    <tr data-rid="${r.id || ''}">
+      <td>${(r.name||'').replace(/</g,'&lt;')}</td>
+      <td>${(r.pd||'').replace(/</g,'&lt;')}</td>
+      <td>${r.usedDays}일</td>
+      <td class="shy"><button class="xbtn report-delete" title="삭제">×</button></td>
+    </tr>`).join('');
+  panel.innerHTML = `
+    <table class="report-table">
+      <thead><tr><th>작업내용</th><th>담당 PD</th><th>작업소요시간</th><th class="shy"></th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+  panel.querySelectorAll('.report-delete').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      if(!canEdit()) return;
+      const tr = btn.closest('tr');
+      const rid = tr.getAttribute('data-rid');
+      let removed = false;
+      if(rid){
+        const idx = state.reports.findIndex(r=> r.id===rid);
+        if(idx>=0){ state.reports.splice(idx,1); removed = true; }
+      }
+      if(!removed){
+        const name = tr.children[0].innerText;
+        const pd = tr.children[1].innerText;
+        const usedDays = parseInt((tr.children[2].innerText||'').replace(/\D/g,''),10);
+        const idx = state.reports.findIndex(r=> r.owner===state.owner && r.month===monthNum && (r.name===name) && ((r.pd||'')===pd) && r.usedDays===usedDays);
+        if(idx>=0) state.reports.splice(idx,1);
+      }
+      localStorage.setItem('sched:reports', JSON.stringify(state.reports));
+      renderReports(); saveNowAuto();
+    }, {passive:true});
+  });
+}
+
+/* =========================
+ * 메인 테이블 렌더
+ * ========================= */
+function renderTable(){
+  renderOwnerDropdown();
+
+  const startBase = state.startByOwner[state.owner] || getRealTodayISO(); // ✅ 기준일은 항상 실제 오늘을 기본
+  $('#startDate').value = getTodayISO(); // 화면에는 (TEST 반영한) 오늘 표시
+
+  const rowsEl = $('#taskRows'); rowsEl.innerHTML='';
+
+  // 그룹 유효성
+  const ownerIds = new Set(state.tasks.filter(x => x.owner === state.owner).map(x => x.id));
+  state.tasks = state.tasks.map(t => {
+    if (t.owner !== state.owner) return t;
+    const valid = t.group && ownerIds.has(t.group) && isSimple(t);
+    return valid ? t : { ...t, group: null };
+  });
+
+  const visibleTasks = state.tasks.filter(t=>t.owner===state.owner);
+
+  // 진행중 후보 (첫 메인)
+  const firstActiveMain = visibleTasks.find(t=>!t.group && !t.completed && !t.planned);
+  const progressingId = firstActiveMain ? firstActiveMain.id : null;
+  syncTopProgress(progressingId);
+
+  const planned = computeSchedule(visibleTasks, startBase, progressingId);
+  
+  
+  
+  // ✅ 완료 항목도 포함: 최근 7일 내의 완료만 추가
+const RECENT_DAYS = 7;
+const today = getRealTodayDate();
+const recentCompleted = (state.reports || [])
+  .filter(r => {
+    if (r.owner !== state.owner || !r.completedAt) return false;
+    const d = parseISO(r.completedAt);
+    const diff = Math.floor((today - d) / 86400000);
+    return diff >= 0 && diff <= RECENT_DAYS;
+  })
+  .map(r => {
+    const date = parseISO(r.completedAt);
+    return {
+      id: 'done-' + r.id,
+      start: date,
+      end: date,
+      name: r.name,
+      pd: r.pd || '',
+      completed: true,
+      meta: { total: 1 }
+    };
+  });
+
+const plannedWithCompleted = [...planned, ...recentCompleted];
+renderCalendar(plannedWithCompleted, state.owner, progressingId);
+
+
+  const mobile = isMobileView();
+
+  planned.forEach((t, idx)=>{
+    const isChild = !!t.group;
+    const isInProgress = (t.id===progressingId) && !t.planned && !t.completed;
+
+    const total = t.meta ? t.meta.total : ((t.duration||0)+(t.extraDays||0));
+    const progress = t.meta ? t.meta.progress : 0;
+    const canCompleteNow = !t.completed && !t.planned && !isChild && (progress >= total);
+
+    // 상태 뱃지
+    let statusHTML;
+    if (t.completed) statusHTML = '<span class="status-pill completed">완료</span>';
+    else if (isChild && isSimple(t)) statusHTML = '<span class="status-pill concurrent">동시</span>';
+    else if (isInProgress) statusHTML = '<span class="status-pill inprogress">진행중</span>';
+    else statusHTML = '<span class="status-pill pending">예정중</span>';
+
+    const row = document.createElement('div');
+    const cls = ['row-item']; if (isChild) cls.push('child'); if (isInProgress && !t.completed) cls.push('inprogress'); if (t.completed) cls.push('completed');
+    row.className = cls.join(' ');
+
+    const workTypeSelectHTML = `
+      <select class="input workTypeSel" style="width:90px">
+        <option value="NEW"${t.workType==='NEW'?' selected':''}>NEW</option>
+        <option value="수정"${t.workType==='수정'?' selected':''}>수정</option>
+        <option value="간단수정"${t.workType==='간단수정'?' selected':''}>간단수정</option>
+        <option value="전체수정"${t.workType==='전체수정'?' selected':''}>전체수정</option>
+      </select>`;
+
+    const leftHTML = `
+      <span class="drag" title="드래그하여 순서 변경">≡</span>
+      ${isChild?'<span class="namePrefix" style="color:#9ca3af;margin-right:6px">↳</span>':''}
+      <input class="input nameInput" style="margin-left:8px" value="${(t.name||'').replace(/"/g,'&quot;')}" ${canEdit()?'':'disabled'} />
+      <input class="input pd pdInput" placeholder="담당 PD" value="${(t.pd||'').replace(/"/g,'&quot;')}" ${canEdit()?'':'disabled'} />
+      ${canEdit()? workTypeSelectHTML : workTypeSelectHTML.replace('class="input workTypeSel"','class="input workTypeSel" disabled')}
+      ${t.planned ? (isChild && isSimple(t) ? '<span class="badge-concurrent">동시</span>' : '<span class="badge-plan">예정</span>') : ''}
+    `;
+
+    const incBtnHTML = `<button class="iconbtn incBtn" title="하루 추가" ${(canEdit() && !(isSimple(t) && isChild))?'':'disabled'}>▲</button>`;
+    const idBtnHTML = (!isChild)
+      ? `<button class="btn msg-btn tg-id-btn" title="PD chat_id 설정">${TELEGRAM_SVG}</button>` : "";
+
+    let actionsHTML = '';
+    if (t.planned){
+      const startBtn = (!isChild && canEdit())
+        ? `<button class="btn primary start-task">작업시작</button>`
+        : `<button class="btn" disabled>작업시작</button>`;
+      actionsHTML = `${startBtn}<button class="btn hold hold-task" ${canEdit()?'':'disabled'}>보류</button>${idBtnHTML}`;
+    } else {
+      let leftBtnHTML;
+      if (canCompleteNow) leftBtnHTML = `<button class="btn primary complete-now" ${canEdit()?'':'disabled'}>완료처리</button>`;
+      else if (isInProgress) leftBtnHTML = `<button class="btn go mark-complete" ${canEdit()?'':'disabled'}>진행중</button>`;
+      else if (isChild && isSimple(t)) leftBtnHTML = '<button class="btn concurrent" disabled>동시</button>';
+      else leftBtnHTML = '<button class="btn danger" disabled>예정중</button>';
+      actionsHTML = `${leftBtnHTML}<button class="btn hold hold-task" ${canEdit()?'':'disabled'}>보류</button>${idBtnHTML}`;
+    }
+
+    if(!mobile){
+      row.innerHTML = `
+        <div class="cell">${leftHTML}</div>
+        <div class="cell">
+          <div class="durView">
+            <span class="durText">${total}일</span>
+            ${incBtnHTML}
+          </div>
+        </div>
+        <div class="cell">
+          <span class="pill">${t.start ? toISO(t.start) : ''}</span>
+          ${statusHTML}
+        </div>
+        <div class="cell actions">${actionsHTML}</div>`;
+    } else {
+      const line = [esc(t.name||'Untitled'), esc(t.pd||'-'), esc(t.workType||'NEW')].join(', ');
+      let statusCompact = statusHTML.replace('진행중','진행').replace('예정중','예정');
+      row.innerHTML = `
+        <div class="cell">
+          ${isChild?'<span class="namePrefix" aria-hidden="true">↳</span>':''}
+          <span class="m-line" title="${line}">${line}</span>
+        </div>
+        <div class="cell"><span class="m-date">${t.start ? toISO(t.start) : '-'}</span></div>
+        <div class="cell">${statusCompact}</div>`;
+    }
+
+    // 바인딩
+    const nameInput = row.querySelector('.nameInput');
+    const pdInput   = row.querySelector('.pdInput');
+    const workTypeSel = row.querySelector('.workTypeSel');
+    const incBtn    = row.querySelector('.incBtn');
+    const completeBtn = row.querySelector('.complete-now');
+    const holdBtn   = row.querySelector('.hold-task');
+    const startBtn  = row.querySelector('.start-task');
+    const handle    = row.querySelector('.drag');
+    const idBtn     = row.querySelector('.tg-id-btn');
+    const markBtn   = row.querySelector('.mark-complete');
+
+    if (idBtn){
+      idBtn.addEventListener('click', ()=>{
+        const names = parsePDs(t.pd);
+        if(!names.length){ alert('PD 이름이 비어 있습니다. 먼저 PD를 입력하세요.'); return; }
+        const existing = getPDChatIdFromStorage(names[0]) || PD_CHAT_MAP[names[0]] || '';
+        const val = prompt(`PD: ${names.join(', ')}\nchat_id를 입력하세요 (입력한 값을 위 PD 전원에게 저장):`, existing);
+        if(!val) return;
+        const id = val.trim(); names.forEach(n => setPDChatIdToStorage(n, id));
+        alert('저장되었습니다.');
+      }, {passive:true});
+    }
+
+    [nameInput, pdInput].forEach(el=>{ if(!el) return; el.setAttribute('draggable','false'); el.addEventListener('dragstart', e=>e.preventDefault(), {passive:true}); });
+
+    if(incBtn && !incBtn.disabled){
+      incBtn.addEventListener('click', ()=>{
+        if(!canEdit()) return;
+        const i = state.tasks.findIndex(x=>x.id===t.id);
+        if(i>=0){
+          state.tasks[i].extraDays = (state.tasks[i].extraDays||0) + 1;
+          localStorage.setItem('sched:tasks', JSON.stringify(state.tasks));
+          renderAll(); saveNowAuto();
+        }
+      }, {passive:true});
+    }
+
+    if(startBtn){
+      startBtn.addEventListener('click', async ()=>{
+        if(!canEdit()) return;
+        try{
+          const def = { startISO: getTodayISO(), duration: (t.duration||1) };
+          const { startISO, duration } = await openScheduleDialog(def);
+          const i = state.tasks.findIndex(x=>x.id===t.id);
+          if(i>=0){
+            state.tasks[i].planned = false;
+            state.tasks[i].startedAt = startISO;
+            state.tasks[i].duration = Math.max(1, parseInt(duration,10)||1);
+            localStorage.setItem('sched:tasks', JSON.stringify(state.tasks));
+            renderAll(); saveNowAuto();
+          }
+        }catch(e){}
+      });
+    }
+
+    if(completeBtn){
+      completeBtn.addEventListener('click', ()=>{
+        if(!canEdit()) return;
+        finishTaskBlockAndReschedule(t);
+      }, {passive:true});
+    }
+
+    if(markBtn){
+      markBtn.addEventListener('click', ()=>{
+        if(!canEdit()) return;
+        if(!confirm('현재 작업을 완료처리하시겠습니까?')) return;
+        finishTaskBlockAndReschedule(t);
+      }, {passive:true});
+    }
+
+    if(holdBtn && !holdBtn.disabled){
+      holdBtn.addEventListener('click', ()=>{
+        if(!canEdit()) { alert('비밀번호 해제 후 보류할 수 있습니다.'); return; }
+        const cur = state.tasks.find(x=>x.id===t.id);
+        if(!cur) return;
+
+        const isParent = !cur.group;
+        let ids;
+        if(isParent){ ids = collectDescendantIds(state.tasks, cur.id); }
+        else{ ids = new Set([cur.id]); }
+
+        const moving = state.tasks.filter(x=> ids.has(x.id));
+        const moved = moving.map(x=>({ ...x, planned: true, inProgress:false, completed:false, startedAt:null, completedAt:null, heldAt: getRealTodayISO() }));
+
+        if (ids.has(__lastTopId)) __lastTopId = null;
+
+        state.holds.push(...moved);
+        state.tasks = state.tasks.filter(x=> !ids.has(x.id));
+
+        localStorage.setItem('sched:holds', JSON.stringify(state.holds));
+        localStorage.setItem('sched:tasks', JSON.stringify(state.tasks));
+        state.reportTabKey = 'hold';
+        renderAll(); saveNowAuto();
+      }, {passive:true});
+    }
+
+    // 데스크톱 DnD
+    if(!mobile && handle){
+      handle.setAttribute('draggable','true');
+      handle.addEventListener('dragstart', (e)=>{ e.dataTransfer.effectAllowed='move'; e.dataTransfer.setData('text/plain', String(idx)); row.classList.add('dragging'); });
+      row.addEventListener('dragend', ()=> row.classList.remove('dragging'));
+      row.addEventListener('dragover', (e)=>{ e.preventDefault(); e.dataTransfer.dropEffect='move'; row.classList.add('dragover'); });
+      row.addEventListener('dragleave', ()=> row.classList.remove('dragover'));
+      row.addEventListener('drop', (e)=>{
+        e.preventDefault(); row.classList.remove('dragover');
+
+        const fromPlannedIdx = parseInt(e.dataTransfer.getData('text/plain'),10);
+        const toPlannedIdx   = idx;
+        if(!Number.isInteger(fromPlannedIdx)) return;
+
+        const visible = state.tasks.filter(x=>x.owner===state.owner);
+        const plannedNow = computeSchedule(visible, state.startByOwner[state.owner]||getRealTodayISO(), progressingId);
+
+        const fromTaskId = plannedNow[fromPlannedIdx]?.id;
+        const toTaskId   = plannedNow[toPlannedIdx]?.id;
+        if(!fromTaskId || !toTaskId) return;
+
+        const fromIdx = state.tasks.findIndex(x=>x.id===fromTaskId);
+        const toIdx   = state.tasks.findIndex(x=>x.id===toTaskId);
+        if(fromIdx<0 || toIdx<0 || fromIdx===toIdx) return;
+
+        const arr=[...state.tasks];
+        const fromTask={...arr[fromIdx]};
+        const toTask=arr[toIdx];
+        if(fromTask.owner!==state.owner || toTask.owner!==state.owner) return;
+
+        arr.splice(fromIdx,1);
+        if(isSimple(fromTask)){
+          let insertPos=toIdx+1;
+          while(insertPos<arr.length && arr[insertPos].group===toTask.id) insertPos++;
+          fromTask.group=toTask.id; 
+          arr.splice(insertPos,0,fromTask);
+        }else{
+          fromTask.group=null;
+          const insertPos=toIdx;
+          arr.splice(insertPos,0,fromTask);
+        }
+        state.tasks=arr;
+
+        const visibleAfter = state.tasks.filter(x=>x.owner===state.owner);
+        const plannedAfter = computeSchedule(visibleAfter, state.startByOwner[state.owner]||getRealTodayISO(), progressingId);
+
+        // 알림 로직(원본 유지)
+        const parentNow   = plannedNow.filter(p => !p.group).map(p => p.id);
+        const parentAfter = plannedAfter.filter(p => !p.group).map(p => p.id);
+
+        const oldIdxParent = parentNow.indexOf(fromTaskId);
+        const newIdxParent = parentAfter.indexOf(fromTaskId);
+
+        const movingWasMain = !plannedNow[fromPlannedIdx]?.group;
+        const isMainAfter   = newIdxParent >= 0;
+        const movedUpParent = (newIdxParent >= 0 && oldIdxParent >= 0 && newIdxParent < oldIdxParent);
+
+        if (movingWasMain && isMainAfter && movedUpParent) {
+          const adv = plannedAfter.find(p => p.id === fromTaskId);
+
+          if (newIdxParent === 0) {
+            const leadStartISO = adv.start ? toISO(adv.start) : getRealTodayISO();
+            sendToPDsAuto(adv.pd, oneLineLeadMsg(adv.name, leadStartISO));
+
+            const jumpedParents = parentNow.slice(0, oldIdxParent);
+            jumpedParents.forEach(pid=>{
+              const delayedAfter = plannedAfter.find(p => p.id === pid);
+              if(!delayedAfter) return;
+              const newDateISO = delayedAfter.start ? toISO(delayedAfter.start) : getRealTodayISO();
+              sendToPDsAuto(delayedAfter.pd, oneLineDelayMsg(adv.name, delayedAfter.name, newDateISO));
+            });
+
+          } else {
+            const jumpedParents = parentNow.slice(newIdxParent, oldIdxParent);
+            jumpedParents.forEach(pid=>{
+              const delayedAfter = plannedAfter.find(p => p.id === pid);
+              if(!delayedAfter) return;
+              sendToPDsAuto(delayedAfter.pd, oneLineSwapDelayedMsg(adv.name));
+            });
+
+            const jumpedNames = jumpedParents
+              .map(pid => plannedAfter.find(p => p.id === pid))
+              .filter(Boolean).map(p => p.name);
+            if (jumpedNames.length){
+              const list = jumpedNames.join(", ");
+              sendToPDsAuto(adv.pd, oneLineSwapAdvanceMsg(list));
+            }
+          }
+        }
+
+        localStorage.setItem('sched:tasks', JSON.stringify(state.tasks));
+        renderAll();
+        saveNowAuto();
+      });
+    } else if(handle){ handle.style.visibility='hidden'; }
+
+    if(canEdit()){
+      const commit = ()=>{ localStorage.setItem('sched:tasks', JSON.stringify(state.tasks)); renderAll(); saveNowAuto(); };
+      const iIdx = state.tasks.findIndex(x=>x.id===t.id);
+      if(nameInput){ nameInput.addEventListener('change', ()=>{ state.tasks[iIdx].name = nameInput.value.trim() || 'Untitled'; commit(); }); }
+      if(pdInput){ pdInput.addEventListener('change', ()=>{ state.tasks[iIdx].pd = pdInput.value.trim(); commit(); }); }
+      if(workTypeSel){
+        workTypeSel.addEventListener('change', ()=>{
+          const val = workTypeSel.value;
+          state.tasks[iIdx].workType = val;
+          state.tasks[iIdx].parallel = (val==='간단수정');
+          if(val!=='간단수정'){ state.tasks[iIdx].group = null; }
+          commit();
+        });
+      }
+    }
+
+    rowsEl.appendChild(row);
+  });
+
+  renderCalendar(planned, state.owner, progressingId);
+  
+  
+}
+
+/* =========================
+ * 페이지 이벤트/초기 로드
+ * ========================= */
+document.addEventListener('DOMContentLoaded', ()=>{
+  if (__read_ONLY__) {
+    document.querySelectorAll('input, select, textarea, button').forEach(el => el.disabled = true);
+    const addBtn = document.getElementById('addBtn'); if(addBtn) addBtn.style.display='none';
+    const saveBtn = document.getElementById('saveBtn'); if(saveBtn) saveBtn.style.display='none';
+    setStatus('읽기 전용(저장 안 함)');
+  } else {
+    setStatus('수동 저장 모드');
+    const sb = document.getElementById('saveBtn');
+    if (sb) sb.addEventListener('click', saveNow);
+  }
+}, {passive:true});
+
+window.addEventListener('resize', debounce(()=> renderAll(), 150));
+
+document.getElementById('ownerSel').addEventListener('change', (e)=>{
+  const v=e.target.value;
+  if(v==='__add__'){
+    setTimeout(()=>{ $('#ownerSel').value = state.owner; },0);
+    const name=(prompt('추가할 사용자 이름을 입력하세요:')||'').trim();
+    if(!name) return;
+    if(state.owners.includes(name)){ alert('이미 존재하는 사용자입니다.'); return; }
+    state.owners.push(name);
+    state.startByOwner[name]=getRealTodayISO();  // ✅ 실제 오늘
+    state.owner=name;
+    localStorage.setItem('sched:owners', JSON.stringify(state.owners));
+    localStorage.setItem('sched:startByOwner', JSON.stringify(state.startByOwner));
+    localStorage.setItem('sched:owner', state.owner);
+    renderAll(); saveNowAuto();
+    return;
+  }
+  if(v==='__delete__'){
+    setTimeout(()=>{ $('#ownerSel').value = state.owner; },0);
+    if(!state.owners.length){ alert('삭제할 사용자가 없습니다.'); return; }
+    const target=prompt('삭제할 사용자 이름을 정확히 입력하세요:');
+    if(!target) return;
+    if(!state.owners.includes(target)){ alert('해당 사용자가 목록에 없습니다.'); return; }
+    const hasTasks=state.tasks.some(t=>t.owner===target);
+    if(hasTasks && !confirm(`"${target}" 사용자에 할당된 작업이 있습니다.\n모두 삭제하고 사용자를 제거할까요?`)) return;
+    if(hasTasks){ state.tasks=state.tasks.filter(t=>t.owner!==target); }
+    state.reports = state.reports.filter(r=>r.owner!==target);
+    state.holds = state.holds.filter(h=>h.owner!==target);
+    delete state.startByOwner[target];
+    state.owners=state.owners.filter(o=>o!==target);
+    if(state.owner===target) state.owner=state.owners[0]||'';
+    localStorage.setItem('sched:owners', JSON.stringify(state.owners));
+    localStorage.setItem('sched:owner', state.owner);
+    localStorage.setItem('sched:startByOwner', JSON.stringify(state.startByOwner));
+    localStorage.setItem('sched:tasks', JSON.stringify(state.tasks));
+    localStorage.setItem('sched:reports', JSON.stringify(state.reports));
+    localStorage.setItem('sched:holds', JSON.stringify(state.holds));
+    renderAll(); saveNowAuto();
+    return;
+  }
+  state.owner=v; localStorage.setItem('sched:owner', state.owner); renderAll();
+});
+
+// 시작일 UI(표시만)
+document.getElementById('startDate').addEventListener('change', ()=>{ /* disabled */ });
+
+// 작업 추가
+document.getElementById('addBtn').addEventListener('click', ()=>{
+  if(!canEdit()){ alert('비밀번호를 먼저 해제하세요.'); return; }
+
+  // ✅ 새 작업 추가 직전에 기준일을 "실제 오늘"로 보정(PC 날짜 변경 후 복귀 이슈 방지)
+  ensureBaselineToday(state.owner);
+
+  const name=$('#taskName').value.trim();
+  const pd=$('#taskPD').value.trim();
+  const typ=$('#taskType').value;
+  const planned=$('#taskPlanned').checked;
+  let dur=parseInt($('#taskDur').value,10);
+  if(!name || !(dur>0)) return;
+
+  const newTask = {
+    id:uid(), owner:state.owner, name, duration:dur, extraDays:0, pd,
+    workType: typ, parallel: (typ==='간단수정'), group:null,
+    planned:planned, inProgress:false, completed:false,
+    startedAt:null, completedAt:null,
+    spentDays:0, activeSinceISO:null
+  };
+  state.tasks.push(newTask);
+
+  $('#taskName').value=''; $('#taskPD').value=''; $('#taskDur').value=1; $('#taskType').value='NEW'; $('#taskPlanned').checked=false;
+
+  localStorage.setItem('sched:tasks', JSON.stringify(state.tasks));
+  renderAll(); saveNowAuto();
+
+  if(planned){
+    alert('예정으로 추가되었습니다. 행의 "작업시작" 버튼으로 시작일을 설정하세요.');
+  }
+});
+
+/* =========================
+ * 초기 로드
+ * ========================= */
+async function loadFromJSONBinAndRender(){
+  try{
+    const data = await jsonbinGet();
+    if (Array.isArray(data.owners) && data.owners.length){ state.owners = data.owners.slice(); }
+    else {
+      const inferred = new Set(state.owners);
+      if (Array.isArray(data.tasks)) data.tasks.forEach(t=> inferred.add(t.owner||'김정용'));
+      state.owners = Array.from(inferred);
+    }
+
+    if (data.startByOwner && typeof data.startByOwner==='object'){
+      const merged={}; state.owners.forEach(o=> merged[o]=data.startByOwner[o]||getRealTodayISO()); // ✅ 실제 오늘
+      state.startByOwner=merged;
+    }
+
+    if (Array.isArray(data.tasks)){
+      state.tasks = data.tasks.map(t=>{
+        const workType = t.workType || (t.parallel ? '간단수정' : 'NEW');
+        return {
+          id: t.id||uid(),
+          owner: t.owner||'김정용',
+          name: t.name||'Untitled',
+          duration: t.duration>0?t.duration:1,
+          extraDays: Number.isFinite(t.extraDays)? t.extraDays : 0,
+          pd: t.pd||'',
+          workType,
+          parallel: workType==='간단수정',
+          group: (workType==='간단수정') ? (t.group||null) : null,
+          planned: !!t.planned,
+          inProgress: !!t.inProgress,
+          completed: !!t.completed,
+          startedAt: t.startedAt||null,
+          completedAt: t.completedAt||null,
+          spentDays: Number.isFinite(t.spentDays) ? t.spentDays : 0,
+          activeSinceISO: t.activeSinceISO || null
+        };
+      });
+    }
+
+    if (Array.isArray(data.reports)){ state.reports = data.reports.map(r=> ({ ...r, id: r.id || uid() })); }
+    if (Array.isArray(data.holds)){ state.holds = data.holds; }
+
+    lastSavedJSON = JSON.stringify({ owners:state.owners, startByOwner:state.startByOwner, tasks:state.tasks, reports:state.reports, holds:state.holds });
+    localStorage.setItem('sched:owners', JSON.stringify(state.owners));
+    localStorage.setItem('sched:owner', state.owner);
+    localStorage.setItem('sched:startByOwner', JSON.stringify(state.startByOwner));
+    localStorage.setItem('sched:tasks', JSON.stringify(state.tasks));
+    localStorage.setItem('sched:reports', JSON.stringify(state.reports));
+    localStorage.setItem('sched:holds', JSON.stringify(state.holds));
+    if(CAN_EDIT) setStatus('저장됨');
+  }catch(e){
+    setStatus(CAN_EDIT ? '오프라인(로컬)' : '읽기 전용(저장 안 함)');
+  }
+  renderAll();
+}
+
+// 기준일 유지 + UI는 '오늘'(TEST 반영) 고정 표시
+function renderAll(){
+  renderOwnerDropdown();
+  const sd = $('#startDate');
+  if (sd){ sd.value = getTodayISO(); sd.setAttribute('disabled', 'disabled'); }
+  refreshPassUI();
+  renderReports();
+  renderTable();
+}
+
+function refreshPassUI(){
+  const badge=$('#lockBadge'), passBtn=$('#passBtn'), passOffBtn=$('#passOffBtn'), passInput=$('#editPass');
+  if(PASS_OK){
+    badge.textContent='해제'; badge.className='badge-unlock';
+    passBtn.style.display='none'; passOffBtn.style.display='inline-block'; passInput.disabled=true;
+  } else {
+    badge.textContent='잠금'; badge.className='badge-lock';
+    passBtn.style.display='inline-block'; passOffBtn.style.display='none'; passInput.disabled=false;
+  }
+  document.querySelectorAll('.add-task-form input, .add-task-form button, .add-task-form select')
+    .forEach(el=>{ el.disabled = !canEdit(); });
+
+  const reportsCard = document.getElementById('reportsCard');
+  if (reportsCard){ reportsCard.style.display = PASS_OK ? '' : 'none'; }
+}
+
+document.getElementById('passBtn').addEventListener('click', ()=>{
+  if(!CAN_EDIT){ alert('읽기 전용입니다.'); return; }
+  const v=($('#editPass').value||'').trim();
+  if(!v){ alert('비밀번호를 입력하세요.'); return; }
+  if(v===PASS_VALUE){ PASS_OK=true; refreshPassUI(); renderAll(); } else { alert('비밀번호가 올바르지 않습니다.'); }
+});
+document.getElementById('passOffBtn').addEventListener('click', ()=>{
+  PASS_OK=false; $('#editPass').value=''; refreshPassUI(); renderAll();
+});
+
+loadFromJSONBinAndRender();
+</script>
+</body>
+</html>
