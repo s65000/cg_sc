@@ -5,8 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>업무 스케줄러 (주말/공휴일 제외 + 달력/월별/보류) — GAS 저장</title>
 <script>
-/* ========= TEST 모드 스위치 (기본: 꺼짐) ========= */
-window.__TEST_MODE__ = false;    // 테스트 패널에서만 true로 바꿈
+
 // window.__FORCE_TODAY__ = 'YYYY-MM-DD' // 테스트 패널이 설정/해제
 
 /* ========= 공용 선택자 ========= */
@@ -109,21 +108,10 @@ function esc(s){
 function getRealTodayDate(){ const d=new Date(); d.setHours(0,0,0,0); return d; }
 function getRealTodayISO(){ return toISO(getRealTodayDate()); }
 
-// ✅ 화면·엔진에서 쓰는 "오늘" (TEST 모드일 때만 강제값 사용)
-function getTodayDate(){
-  if (window.__TEST_MODE__ &&
-      typeof window.__FORCE_TODAY__ === 'string' &&
-      /^\d{4}-\d{2}-\d{2}$/.test(window.__FORCE_TODAY__)){
-    return parseISO(window.__FORCE_TODAY__);
-  }
-  return getRealTodayDate();
-}
+function getTodayDate(){ return getRealTodayDate(); }
 function getTodayISO(){ return toISO(getTodayDate()); }
 
-function viewTodayISO(){
-  const t = window.__TEST_TODAY__;
-  return (typeof t === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(t)) ? t : getTodayISO();
-}
+
 
 
 // 기준일을 "실제 오늘"로 보정 (테스트 모드 영향 ❌)
@@ -149,6 +137,16 @@ function addBizDays(date, days){
   d.setHours(0,0,0,0);
   return d;
 }
+
+// ✅ 영업일 기준 과거로 N일 이동 (완료 스팬 복원에 필요)
+function subBizDays(date, days){
+  const d = (date instanceof Date) ? new Date(date) : parseISO(String(date));
+  let left = Math.max(0, Math.floor(days));
+  while(left>0){ d.setDate(d.getDate()-1); if(isBiz(d)) left--; }
+  d.setHours(0,0,0,0);
+  return d;
+}
+
 function bizDaysBetween(startDate, endDate){
   if(!startDate || !endDate) return 0;
   const s = (startDate instanceof Date) ? new Date(startDate) : parseISO(String(startDate));
@@ -311,7 +309,7 @@ function effectiveDuration(t){
   let progress = 0;
   if (!t.planned && !t.completed && t.startedAt) {
     const s = parseISO(t.startedAt);
-    const e = parseISO(viewTodayISO()); // TEST 모드일 때는 가짜 오늘로 진행률 시뮬
+    const e = parseISO(getTodayISO());
     progress = Math.min(total, Math.max(0, bizDaysBetween(s, e)));
   }
   const remain = Math.max(0, total - progress);
@@ -353,7 +351,7 @@ function computeSchedule(tasks, startISO, activeTopId){
     const isTop = t.id === activeTopId;
     const meta  = effectiveDuration(t);
 
-    const todayD = parseISO(viewTodayISO());
+    const todayD = parseISO(getTodayISO());
     const expectedEnd = addBizDays(start, Math.max(0, (meta.total||0) - 1));
 
     // ✅ 기본은 항상 '배정 종료일' 고정
@@ -388,12 +386,12 @@ function finishTaskBlockAndReschedule(taskLike, completedISO){
   const block = state.tasks.filter(x=> ids.has(x.id));
 
   // 완료 기준일: 전달값 > 테스트 오늘 > 실제 오늘
-  const todayISO = completedISO || viewTodayISO();
+  const todayISO = completedISO || getTodayISO();
   const todayD   = parseISO(todayISO);
 
   // === 완료 직전의 스케줄을 "현재 기준"으로 다시 계산해서,
   //     해당 parent row의 meta.total / meta.overdueDays를 그대로 사용 ===
-  const startBase = state.startByOwner[state.owner] || viewTodayISO();
+  const startBase = state.startByOwner[state.owner] || getRealTodayISO();
   const visible   = state.tasks.filter(t=> t.owner === state.owner);
   const firstActiveMain = visible.find(t=> !t.group && !t.completed && !t.planned);
   const progressingId   = firstActiveMain ? firstActiveMain.id : null;
@@ -438,9 +436,6 @@ block.forEach(it => {
     // 포함-포함 영업일 카운트 (같은 날 시작/완료면 1일)
     let actualUsed = bizDaysBetween(startAnchor, todayD);
 
-    // 필요하면 “같은 날은 0일로 취급” 원한다면 아래 한 줄 주석 해제
-    // actualUsed = Math.max(0, actualUsed - 1);
-
     state.reports.push({
       id: uid(),
       owner: it.owner,
@@ -466,8 +461,6 @@ block.forEach(it => {
   }
 });
 
-
-
   // 완료된 묶음 제거
   if (ids.has(__lastTopId)) __lastTopId = null;
   state.tasks = state.tasks.filter(x=> !ids.has(x.id));
@@ -485,8 +478,6 @@ block.forEach(it => {
   renderAll();
   saveNowAuto();
 }
-
-
 
 
 /* =========================
@@ -623,11 +614,19 @@ const TELEGRAM_SVG = `
 
 .row-item.completed .drag{visibility:hidden}
 
-/* 달력 라벨/점도 완료면 흐리게 표시할 준비 */
+/* 달력 라벨/점도 완료면 흐리게 표시 */
 .taskdot.done .dot{ opacity:.4; filter:grayscale(1); }
 .taskdot.done span{ opacity:.6; filter:grayscale(1); }
 .dot.done{ opacity:.4; filter:grayscale(1); }
 
+/* ★ 추가: 완료만 있는 날은 셀 자체를 회색 비활성화 */
+.day.completed-day{
+  background:#f3f4f6 !important;
+  border-color:#d1d5db !important;
+}
+.day.completed-day .date{
+  color:#6b7280 !important;
+}
 
   .status-pill{ display:inline-block; margin-left:6px; padding:2px 6px; border-radius:999px; font-size:11px; line-height:1; border:1px solid var(--line); }
   .status-pill.pending{ background:#fee2e2; color:#991b1b; border-color:#fecaca; }
@@ -751,12 +750,12 @@ const TELEGRAM_SVG = `
   /* 데스크톱(1100px 이상)에서 NEW/수정/간단수정 select 박스를 더 작게 */
 @media (min-width: 1100px) {
   select.input.workTypeSel {
-    width: 80px !important;   /* 기본 90px → 더 작게 */
-    padding: 1px 4px;         /* 안쪽 여백 줄임 */
-    height: 25px;             /* 높이 줄임 */
-    font-size: 12px;          /* 글자 크기 줄임 */
+    width: 80px !important;
+    padding: 1px 4px;
+    height: 25px;
+    font-size: 12px;
     line-height: 1.2;
-    border-radius: 4px;       /* 둥근 정도 줄임 */
+    border-radius: 4px;
   }
 }
 
@@ -764,8 +763,8 @@ const TELEGRAM_SVG = `
 .cell.actions{
   display: flex;
   align-items: center;
-  gap: 8px;          /* ← 버튼 사이 간격 */
-  flex-wrap: wrap;   /* 칸이 좁을 때 줄바꿈 허용 */
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 /* 데스크톱에서 조금 더 여유 */
@@ -773,13 +772,8 @@ const TELEGRAM_SVG = `
   .cell.actions{ gap: 10px; }
 }
 
-/* 텔레그램 버튼만 살짝 간격 보정이 필요하면(선택) */
+/* 텔레그램 버튼만 살짝 간격 보정(선택) */
 .cell.actions .btn.msg-btn{ padding-left: 10px; padding-right: 10px; }
-
-
-
-
-
 </style>
 </head>
 <body>
@@ -807,113 +801,9 @@ const TELEGRAM_SVG = `
       </div>
     </header>
 
-    <!-- === TEST PANEL (붙였다 떼기 쉬움) === -->
-    <div id="testPanel" class="test-panel" style="display:block">
-      <strong style="font-size:12px;">테스트</strong>
-      <button class="tbtn" data-jump="-5">오늘-5</button>
-      <button class="tbtn" data-jump="-1">오늘-1</button>
-      <button class="tbtn primary" id="tp-today">실제오늘</button>
-      <button class="tbtn" data-jump="+1">오늘+1</button>
-      <button class="tbtn" data-jump="+5">오늘+5</button>
-      <span class="sep">|</span>
-      <input type="date" id="tp-date">
-      <button class="tbtn" id="tp-apply">적용</button>
-      <button class="tbtn" id="tp-clear">모의해제</button>
-      <span class="sep">|</span>
-      <button class="tbtn" id="tp-sample">샘플작업 추가</button>
-      <button class="tbtn danger" id="tp-wipe">현재 사용자 작업 삭제</button>
-    </div>
 
-    <script>
-    /* === TEST PANEL JS === */
-    (function(){
-      const pad = n => String(n).padStart(2,'0');
-      const toISO = (d)=>{ const x=new Date(d); x.setHours(0,0,0,0); return `${x.getFullYear()}-${pad(x.getMonth()+1)}-${pad(x.getDate())}`; };
-      const parseISO = (s)=>{ const [y,m,d]=s.split('-').map(Number); const x=new Date(y, m-1, d); x.setHours(0,0,0,0); return x; };
-      const addDaysISO = (iso, delta)=> toISO(new Date(parseISO(iso).getTime() + delta*86400000));
-      const $ = (sel)=>document.querySelector(sel);
-      const root = $('#testPanel');
-      if(!root) return;
 
-      // 테스트 스위치 ON
-      window.__TEST_MODE__ = true;
-
-      function currentBaseISO(){ return getTodayISO(); }
-
-      function applyMock(iso){
-        window.__FORCE_TODAY__ = iso;   // ✅ 오직 화면/엔진의 "오늘"만 변경
-        // ❌ baseline(startByOwner)은 건드리지 않음
-        renderAll();
-      }
-      function clearMock(){
-        delete window.__FORCE_TODAY__;
-        renderAll();
-      }
-
-      root.querySelectorAll('.tbtn[data-jump]').forEach(btn=>{
-        btn.addEventListener('click', ()=>{
-          const dj = parseInt(btn.getAttribute('data-jump'),10);
-          const next = addDaysISO(currentBaseISO(), dj);
-          applyMock(next);
-          const inp = $('#tp-date'); if(inp) inp.value = next;
-        }, {passive:true});
-      });
-
-      $('#tp-today')?.addEventListener('click', ()=>{
-        const real = getRealTodayISO();
-        applyMock(real);
-        const inp = $('#tp-date'); if(inp) inp.value = real;
-      }, {passive:true});
-
-      $('#tp-apply')?.addEventListener('click', ()=>{
-        const v = ($('#tp-date')?.value||'').trim();
-        if(!/^\d{4}-\d{2}-\d{2}$/.test(v)) { alert('날짜를 선택하세요 (YYYY-MM-DD)'); return; }
-        applyMock(v);
-      }, {passive:true});
-
-      $('#tp-clear')?.addEventListener('click', ()=>{
-        clearMock();
-        const inp = $('#tp-date'); if(inp) inp.value = '';
-      }, {passive:true});
-
-      $('#tp-sample')?.addEventListener('click', ()=>{
-        if(!state || !state.owner) return alert('사용자가 없습니다.');
-        const base = getTodayISO();
-        const t = {
-          id: 'sample-'+Math.random().toString(36).slice(2,9),
-          owner: state.owner,
-          name: '샘플작업 '+base,
-          duration: 2,
-          extraDays: 0,
-          pd: '김정용',
-          workType: 'NEW',
-          parallel: false,
-          group: null,
-          planned: true,
-          inProgress: false,
-          completed: false,
-          startedAt: null,
-          completedAt: null,
-          spentDays: 0,
-          activeSinceISO: null
-        };
-        state.tasks.push(t);
-        localStorage.setItem('sched:tasks', JSON.stringify(state.tasks));
-        renderAll(); saveNowAuto();
-      }, {passive:true});
-
-      $('#tp-wipe')?.addEventListener('click', ()=>{
-        if(!state || !state.owner) return;
-        if(!confirm(`"${state.owner}"의 작업을 모두 삭제할까요?`)) return;
-        state.tasks = state.tasks.filter(x=> x.owner !== state.owner);
-        localStorage.setItem('sched:tasks', JSON.stringify(state.tasks));
-        renderAll(); saveNowAuto();
-      }, {passive:true});
-
-      const ini = currentBaseISO();
-      const inp = $('#tp-date'); if(inp) inp.value = ini;
-    })();
-    </script>
+    
 
     <!-- 데스크톱 작업 추가 폼 -->
     <div class="controls add-task-form">
@@ -999,8 +889,7 @@ function buildDateMap(rows){
         const key=toISO(d);
         if(!map.has(key)) map.set(key,{list:[],firstId:null});
         const obj=map.get(key);
-        obj.list.push({id:r.id,name:r.name,pd:r.pd||'', completed: !!r.completed});
-
+        obj.list.push({id:r.id,name:r.name,pd:r.pd||'', completed: !!r.completed}); // ★ 완료 여부 유지
         if(!obj.firstId) obj.firstId=r.id;
       }
       d.setDate(d.getDate()+1);
@@ -1018,23 +907,15 @@ function renderCalendar(planned, owner, activeTopId){
 
   const filtered = planned.filter(p => p.start);
 
-  // ✅ 작업이 없어도 달력은 항상 렌더: 현재 달을 기본 범위로 사용
+  // ★ 변경: 항상 "이번 달 + 다음 달" 2개월 보여주기
   const todayISO = getTodayISO();
   const todayD   = parseISO(todayISO);
-  const defaultStart = new Date(todayD.getFullYear(), todayD.getMonth(), 1);
-  const defaultEnd   = new Date(todayD.getFullYear(), todayD.getMonth()+1, 0);
-  const noTasks = filtered.length === 0;
+  const months = [
+    new Date(todayD.getFullYear(), todayD.getMonth(), 1),
+    new Date(todayD.getFullYear(), todayD.getMonth()+1, 1),
+  ];
 
-  // (선택) 안내 문구만 보여주고, 달력 자체는 계속 그림
-  if (noTasks){
-    const info = document.createElement('div');
-    info.className = 'muted';
-    info.style.margin = '0 0 6px 2px';
-    info.textContent = '작업이 없습니다. (달력은 현재 달로 표시됩니다)';
-    mount.appendChild(info);
-  }
-
-  // 지연일(빨간 테두리) 계산은 기존 그대로
+  // 지연일(빨간 테두리) 계산 (기존 유지)
   const delaySet = new Set();
   if (activeTopId){
     const top = planned.find(p => p.id === activeTopId);
@@ -1051,21 +932,6 @@ function renderCalendar(planned, owner, activeTopId){
     }
   }
 
-  // 범위 월 구성: 작업 없으면 현재 달 사용
-  let months = [];
-  const minStart = noTasks
-    ? defaultStart
-    : filtered.reduce((d, r) => (r.start < d ? r.start : d), filtered[0].start);
-  const maxEnd = noTasks
-    ? defaultEnd
-    : filtered.reduce((d, r) => (r.end > d ? r.end : d), filtered[0].end);
-
-  const minDate = new Date(minStart);
-  const maxDate = new Date(maxEnd);
-  const iter = new Date(minDate.getFullYear(), minDate.getMonth(), 1);
-  const last = new Date(maxDate.getFullYear(), maxDate.getMonth(), 1);
-  while (iter <= last){ months.push(new Date(iter)); iter.setMonth(iter.getMonth() + 1); }
-
   const dateMap = buildDateMap(filtered);
   const MONTH_NAMES = ['1월','2월','3월','4월','5월','6월','7월','8월','9월','10월','11월','12월'];
   const DOW = ['일','월','화','수','목','금','토'];
@@ -1075,7 +941,6 @@ function renderCalendar(planned, owner, activeTopId){
 
     const box = document.createElement('div');
     box.className = 'month';
-    // CSS에 .month.today-month > h3::after 스타일이 있으므로 표시를 위해 클래스 부여
     if (y === todayD.getFullYear() && m === todayD.getMonth()){
       box.classList.add('today-month');
     }
@@ -1118,36 +983,69 @@ function renderCalendar(planned, owner, activeTopId){
       if (info){
         const isBizDay = !isWeekend(cur) && !isHoliday(cur);
         if (isBizDay){
-          const first = info.list[0];
-          const color = getProjectColor(first.id);
-          const textColor = getContrastText(color);
+          // ★ 변경: 완료/진행 섞임 처리
+          const anyActive = info.list.some(item => !item.completed);
+          const allDone   = info.list.every(item =>  item.completed);
 
-          cell.classList.add('colored');
-          cell.style.background = color;
-          cell.style.borderColor = color;
-          dateEl.style.color = textColor;
+          if (anyActive){
+            // 기존 컬러 강조 유지
+            const first = info.list[0];
+            const color = getProjectColor(first.id);
+            const textColor = getContrastText(color);
 
-          if (isMobileView()){
-            const row = document.createElement('div');
-            row.className = 'proj-row';
-            info.list.forEach(() => {
-              const dot = document.createElement('span');
-              dot.className = 'dot';
-              dot.style.background = textColor;
-              dot.style.display = 'inline-block';
-              row.appendChild(dot);
-            });
-            cell.appendChild(row);
-          } else {
-            info.list.forEach(item => {
-              const line = document.createElement('div');
-              line.className = 'taskdot';
-              const dot = document.createElement('span'); dot.className = 'dot'; dot.style.background = textColor;
-              const label = document.createElement('span'); label.style.color = textColor;
-              label.textContent = item.pd ? `${item.name} (${item.pd})` : item.name;
-              line.appendChild(dot); line.appendChild(label); cell.appendChild(line);
-            });
+            cell.classList.add('colored');
+            cell.style.background = color;
+            cell.style.borderColor = color;
+            dateEl.style.color = textColor;
+
+            if (isMobileView()){
+              const row = document.createElement('div');
+              row.className = 'proj-row';
+              info.list.forEach((item) => {
+                const dot = document.createElement('span');
+                dot.className = 'dot';
+                // 진행/완료 각각 표시
+                if (item.completed) dot.classList.add('done');
+                dot.style.background = textColor;
+                dot.style.display = 'inline-block';
+                row.appendChild(dot);
+              });
+              cell.appendChild(row);
+            } else {
+              info.list.forEach(item => {
+                const line = document.createElement('div');
+                line.className = 'taskdot';
+                if (item.completed) line.classList.add('done'); // 회색화
+                const dot = document.createElement('span'); dot.className = 'dot'; if(item.completed) dot.classList.add('done'); dot.style.background = textColor;
+                const label = document.createElement('span'); label.style.color = textColor;
+                label.textContent = item.pd ? `${item.name} (${item.pd})` : item.name;
+                line.appendChild(dot); line.appendChild(label); cell.appendChild(line);
+              });
+            }
+          } else if (allDone){
+            // ★ 완료만 있는 날 → 셀 자체를 회색 표시
+            cell.classList.add('completed-day');
+            if (isMobileView()){
+              const row = document.createElement('div');
+              row.className = 'proj-row';
+              info.list.forEach(() => {
+                const dot = document.createElement('span');
+                dot.className = 'dot done';
+                dot.style.display = 'inline-block';
+                row.appendChild(dot);
+              });
+              cell.appendChild(row);
+            } else {
+              info.list.forEach(item => {
+                const line = document.createElement('div');
+                line.className = 'taskdot done';
+                const dot = document.createElement('span'); dot.className = 'dot done';
+                const label = document.createElement('span'); label.textContent = item.pd ? `${item.name} (${item.pd})` : item.name;
+                line.appendChild(dot); line.appendChild(label); cell.appendChild(line);
+              });
+            }
           }
+
           cell.title = info.list.map(x => x.pd ? `${x.name} (${x.pd})` : x.name).join('\n');
         }
       }
@@ -1305,29 +1203,45 @@ function renderTable(){
 
   const planned = computeSchedule(visibleTasks, startBase, progressingId);
   
-  
-  
-  // ✅ 완료 항목도 포함: 최근 7일 내의 완료만 추가
-const RECENT_DAYS = 7;
-const today = getRealTodayDate();
+  // ★ 변경: 완료 표시 기간 확대 (최근 60일)
+  // ✅ 완료 표시: TEST 모드 날짜도 반영 + 스팬(시작~완료) 복원
+const RECENT_DAYS = 180;
+const todayLike = getTodayDate();
+
+const seenDone = new Set(); // ✅ 중복 방지용
+
 const recentCompleted = (state.reports || [])
   .filter(r => {
     if (r.owner !== state.owner || !r.completedAt) return false;
     const d = parseISO(r.completedAt);
-    const diff = Math.floor((today - d) / 86400000);
+    const diff = Math.floor((todayLike - d) / 86400000);
     return diff >= 0 && diff <= RECENT_DAYS;
   })
   .map(r => {
-    const date = parseISO(r.completedAt);
+    const endD = parseISO(r.completedAt);      // 완료일
+    let startD = new Date(endD);               // 기본: 완료 당일
+    const used = Number(r.usedDays);           // 숫자면 스팬 복원
+    if (Number.isFinite(used) && used > 1) {
+      startD = subBizDays(endD, used - 1);     // 포함-포함
+    }
+
+    // ✅ id는 보고서 id를 그대로(안정적) 사용
+    const doneId = 'done-' + String(r.id || '');
     return {
-      id: 'done-' + r.id,
-      start: date,
-      end: date,
+      id: doneId,
+      start: startD,
+      end: endD,
       name: r.name,
       pd: r.pd || '',
       completed: true,
-      meta: { total: 1 }
+      meta: { total: Number.isFinite(used) ? used : 1 }
     };
+  })
+  // ✅ 같은 보고서가 중복으로 들어오지 않도록 dedupe
+  .filter(item => {
+    if (seenDone.has(item.id)) return false;
+    seenDone.add(item.id);
+    return true;
   });
 
 const plannedWithCompleted = [...planned, ...recentCompleted];
@@ -1456,22 +1370,81 @@ renderCalendar(plannedWithCompleted, state.owner, progressingId);
     }
 
     if(startBtn){
-      startBtn.addEventListener('click', async ()=>{
-        if(!canEdit()) return;
-        try{
-          const def = { startISO: getTodayISO(), duration: (t.duration||1) };
-          const { startISO, duration } = await openScheduleDialog(def);
-          const i = state.tasks.findIndex(x=>x.id===t.id);
-          if(i>=0){
-            state.tasks[i].planned = false;
-            state.tasks[i].startedAt = startISO;
-            state.tasks[i].duration = Math.max(1, parseInt(duration,10)||1);
-            localStorage.setItem('sched:tasks', JSON.stringify(state.tasks));
-            renderAll(); saveNowAuto();
-          }
-        }catch(e){}
-      });
+  startBtn.addEventListener('click', ()=>{
+    if(!canEdit()) return;
+
+    // 1) 이 버튼이 눌린 "부모 작업"만 허용 (간단수정 자식에선 무의미)
+    const parentTask = state.tasks.find(x => x.id === t.id);
+    if(!parentTask) return;
+    if (parentTask.group) {      // 자식이면 안내만
+      alert('간단수정(자식) 작업은 개별 시작이 없습니다. 부모 작업에서 시작하세요.');
+      return;
     }
+
+    // 2) 같은 소유자의 "부모+자식 묶음"을 통째로 떼어내기
+    const ids = collectDescendantIds(state.tasks, parentTask.id);  // 부모+자식 id들
+    const arr = [...state.tasks];
+
+    // (a) 떼어낼 블록을 원본 순서대로 모읍니다.
+    const block = arr.filter(x => ids.has(x.id));
+    // (b) 먼저 제거
+    let kept = arr.filter(x => !ids.has(x.id));
+
+    // 3) 같은 owner의 맨 뒤 위치를 계산해서 거기에 "부모 다음 자식들" 순서로 삽입
+    //    (= 이 오너의 마지막 작업들 뒤에 붙이기)
+    const ownerTailIndex = (() => {
+      let last = -1;
+      for (let i = 0; i < kept.length; i++){
+        if (kept[i].owner === state.owner) last = i;
+      }
+      return last; // -1이면 이 오너 작업이 하나도 없다는 뜻
+    })();
+
+    if (ownerTailIndex >= 0){
+      // 같은 오너의 마지막 뒤 위치로 삽입
+      kept.splice(ownerTailIndex + 1, 0, ...block);
+    } else {
+      // 이 오너 작업이 하나도 없으면 배열 앞에 붙임
+      kept.unshift(...block);
+    }
+
+    state.tasks = kept;
+
+    // 4) 새 순서 기준으로 "배정표"를 다시 계산해서, 이 부모 작업의 새 배정 시작일을 얻는다
+    const startBase = state.startByOwner[state.owner] || getRealTodayISO();
+    const visible   = state.tasks.filter(x => x.owner === state.owner);
+
+    const firstActiveMain = visible.find(x => !x.group && !x.completed && !x.planned);
+    const progressingId   = firstActiveMain ? firstActiveMain.id : null;
+
+    const plannedAfter = computeSchedule(visible, startBase, progressingId);
+    const rowAfter     = plannedAfter.find(p => p.id === parentTask.id);
+
+    // 5) 이 배정 시작일로 "그때 시작"하도록 설정 (모달 없이)
+    const startISO = rowAfter && rowAfter.start ? toISO(rowAfter.start) : getTodayISO();
+
+    // 부모+자식 묶음에 일괄 반영: 부모는 planned=false로 시작, 자식은 예정 상태 유지(부모 블록을 따라감)
+    state.tasks = state.tasks.map(x => {
+      if (!ids.has(x.id)) return x;
+      if (x.id === parentTask.id){
+        return {
+          ...x,
+          planned: false,            // 진행 블록(부모)
+          startedAt: startISO,
+          duration: Math.max(1, parseInt(x.duration, 10) || 1)
+        };
+      }
+      // 자식(간단수정)은 부모 블록 기간을 따라가므로 planned 그대로 두어도 스케줄 상 부모와 같이 보입니다.
+      return { ...x };
+    });
+
+    // 저장/리렌더
+    localStorage.setItem('sched:tasks', JSON.stringify(state.tasks));
+    renderAll();
+    saveNowAuto();
+  }, {passive:true});
+}
+
 
     if(completeBtn){
       completeBtn.addEventListener('click', ()=>{
@@ -1629,9 +1602,8 @@ renderCalendar(plannedWithCompleted, state.owner, progressingId);
     rowsEl.appendChild(row);
   });
 
-  renderCalendar(planned, state.owner, progressingId);
-  
-  
+  // ★ 중복 렌더 방지: 위에서 이미 plannedWithCompleted로 렌더함
+  // renderCalendar(planned, state.owner, progressingId);
 }
 
 /* =========================
