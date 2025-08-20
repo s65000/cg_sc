@@ -6,58 +6,9 @@
 <title>업무 스케줄러 (주말/공휴일 제외 + 달력/월별/보류) — GAS 저장</title>
 <script>
 
-// window.__FORCE_TODAY__ = 'YYYY-MM-DD' // 테스트 패널이 설정/해제
 
-/* ========= 공용 선택자 ========= */
-const $ = (sel)=>document.querySelector(sel);
 
-/* ========= 상태 표시 ========= */
-function setStatus(txt){ const el = $('#statusLine'); if(el) el.textContent = txt; }
 
-/* =========================
- * 저장/불러오기(GAS 또는 로컬)
- * ========================= */
-const __read_ONLY__ = false;
-const CAN_EDIT = true;
-
-function hasGAS(){ return !!(window.google && google.script && google.script.run); }
-
-function saveData(data){
-  if(hasGAS()){
-    google.script.run.withSuccessHandler(function(){ setStatus("저장 성공 (서버)"); }).saveData(data);
-  } else {
-    console.log("로컬 실행:", data);
-    setStatus("저장은 로컬에서만 테스트됨 (서버 아님)");
-  }
-}
-
-function jsonbinGet(){
-  return new Promise((resolve)=>{
-    if (hasGAS()){
-      google.script.run.withSuccessHandler((data)=> resolve(data || {}))
-                       .withFailureHandler(()=> resolve({})).getData();
-    } else {
-      try{
-        const raw = localStorage.getItem("sched:server-dump");
-        resolve(raw ? JSON.parse(raw) : {});
-      }catch{ resolve({}); }
-    }
-  });
-}
-
-function jsonbinPut(payload){
-  return new Promise((resolve, reject)=>{
-    if (hasGAS()){
-      google.script.run.withSuccessHandler((res)=> resolve(res || {ok:true}))
-                       .withFailureHandler((err)=> reject(err)).putData(payload);
-    } else {
-      try{
-        localStorage.setItem("sched:server-dump", JSON.stringify(payload));
-        resolve({ok:true, local:true});
-      }catch(e){ reject(e); }
-    }
-  });
-}
 
 /* =========================
  * 뷰포트 체크
@@ -1801,3 +1752,4 @@ loadFromJSONBinAndRender();
 </script>
 </body>
 </html>
+
